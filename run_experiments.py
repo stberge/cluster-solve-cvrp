@@ -60,11 +60,11 @@ from overview import update_overview
 # ============================================================
 
 INSTANCE_DIR = Path(
-    r"C:\Users\20235296\Documents\4de Jaar IE\BEP\data\instances\XL\A - test"
+    r""
 )
 
 RESULT_ROOT = Path(
-    r"C:\Users\20235296\Documents\4de Jaar IE\BEP\results"
+    r""
 )
 
 OVERVIEW_FILE = RESULT_ROOT / "routing_overview.xlsx"
