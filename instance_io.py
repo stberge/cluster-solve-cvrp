@@ -1,139 +1,92 @@
 """
-Reading VRPLIB-style instances, route statistics, text output and plotting.
+Reading VRPLIB-style instances, route statistics, text and .sol output, and plotting.
 
-Plot style (clustered):
-    - each cluster's area is shaded with its convex hull (clear colour)
-    - customers are dots coloured by their cluster
-    - routes are black with a white halo
-    - the legend shows Route / Customer / Depot and a shading key only,
-      never one entry per cluster (there can be 50+ clusters)
-
-Plot style (regular HGS):
-    - routes black, customers black, no shading
+Clustered plots shade each cluster's area and colour its customers.
+Routes are black in both clustered and whole-instance plots.
 """
 
 import numpy as np
-import matplotlib.pyplot as plt
 import matplotlib.patheffects as pe
+import matplotlib.pyplot as plt
 from matplotlib.colors import to_rgba
 from matplotlib.lines import Line2D
-from matplotlib.patches import Polygon, Patch
+from matplotlib.patches import Patch, Polygon
 from scipy.spatial import ConvexHull
 
 
 # ============================================================
-# READ VRP FILE (coordinates, demands, capacity)
+# READ VRP FILE
 # ============================================================
 
 def read_vrp(filepath):
     """
     Read a VRPLIB-style .vrp file.
 
-    Returns:
-        coordinates: np.array of shape (n+1, 2), node 0 = depot
-        demands:     np.array of shape (n+1,), node 0 = depot (0)
-        capacity:    int, vehicle capacity read from the header
+    Returns coordinates (n+1, 2), demands (n+1,) and capacity.
+    Node 0 is the depot.
     """
 
     coordinates = []
     demands = []
     capacity = None
+    section = None
 
-    reading_coords = False
-    reading_demands = False
+    with open(filepath) as f:
 
-    with open(filepath, "r") as f:
+        for raw_line in f:
 
-        for line in f:
-
-            line = line.strip()
+            line = raw_line.strip()
 
             if line.startswith("CAPACITY"):
+                capacity = int(line.split(":")[1])
 
-                # Format: "CAPACITY : 30"
-                capacity = int(
-                    line.split(":")[1].strip()
-                )
+            elif line in ("NODE_COORD_SECTION", "DEMAND_SECTION", "DEPOT_SECTION"):
+                section = line
 
-                continue
-
-            if line == "NODE_COORD_SECTION":
-                reading_coords = True
-                reading_demands = False
-                continue
-
-            if line == "DEMAND_SECTION":
-                reading_coords = False
-                reading_demands = True
-                continue
-
-            if line == "DEPOT_SECTION":
-                reading_coords = False
-                reading_demands = False
-                continue
-
-            if line == "EOF":
+            elif line == "EOF":
                 break
 
-            if reading_coords:
+            elif section == "NODE_COORD_SECTION":
 
                 parts = line.split()
 
                 if len(parts) >= 3:
+                    coordinates.append([float(parts[1]), float(parts[2])])
 
-                    coordinates.append([
-                        float(parts[1]),
-                        float(parts[2])
-                    ])
-
-            elif reading_demands:
+            elif section == "DEMAND_SECTION":
 
                 parts = line.split()
 
                 if len(parts) >= 2:
-
-                    demands.append(
-                        int(parts[1])
-                    )
+                    demands.append(int(parts[1]))
 
     if capacity is None:
-        raise ValueError(
-            f"No CAPACITY field found in {filepath}"
-        )
+        raise ValueError(f"No CAPACITY field found in {filepath}")
 
-    return (
-        np.array(coordinates),
-        np.array(demands),
-        capacity
-    )
+    return np.array(coordinates), np.array(demands), capacity
 
-
-# ============================================================
-# CALCULATE NUMBER OF VEHICLES
-# ============================================================
 
 def calculate_number_of_vehicles(demands, capacity):
 
-    total_demand = demands.sum()
-
-    return int(
-        np.ceil(total_demand / capacity)
-    )
+    return int(np.ceil(demands.sum() / capacity))
 
 
 # ============================================================
 # ROUTE STATISTICS
 # ============================================================
 
+def _leg_distance(a, b):
+    """Euclidean distance rounded to the nearest integer, as in the solver."""
+
+    return int(np.round(np.hypot(a[0] - b[0], a[1] - b[1])))
+
+
 def route_stats(coordinates, demands, routes):
     """
-    Load and distance of every route.
+    Load and distance of every route. Distances use the same rounding as
+    the solver, so the sum over routes matches the solver total.
 
-    Distance uses the same rounding as the PyVRP distance matrices
-    (each leg rounded to the nearest integer), so the sum over all
-    routes matches the solver's total distance.
-
-    Returns: list of dicts {"distance": int, "load": int}, one per route
+    Returns a list of {"distance": int, "load": int}, one per route.
     """
 
     depot = coordinates[0]
@@ -142,34 +95,22 @@ def route_stats(coordinates, demands, routes):
 
     for route in routes:
 
-        points = (
-            [depot]
-            + [coordinates[idx + 1] for idx in route]
-            + [depot]
+        stops = [depot, *(coordinates[i + 1] for i in route), depot]
+
+        distance = sum(
+            _leg_distance(a, b)
+            for a, b in zip(stops[:-1], stops[1:])
         )
 
-        distance = 0
+        load = int(sum(demands[i + 1] for i in route))
 
-        for a, b in zip(points[:-1], points[1:]):
-
-            distance += int(
-                np.round(np.hypot(a[0] - b[0], a[1] - b[1]))
-            )
-
-        load = int(
-            sum(demands[idx + 1] for idx in route)
-        )
-
-        stats.append({
-            "distance": distance,
-            "load": load
-        })
+        stats.append({"distance": distance, "load": load})
 
     return stats
 
 
 # ============================================================
-# WRITE ROUTES TO TEXT FILE
+# TEXT OUTPUT
 # ============================================================
 
 def write_routes_txt(
@@ -180,14 +121,11 @@ def write_routes_txt(
     routes,
     total_distance,
     route_clusters=None,
-    header_lines=()
+    header_lines=(),
 ):
     """
-    Write routes as text. Each route line shows its cluster (if any),
-    its load against capacity, and its distance.
-
-    Returns the per-route statistics (see route_stats), so the caller
-    can check that they add up to total_distance.
+    Write routes as text: one line per route with load, distance and,
+    if given, its cluster. Returns the per-route statistics.
     """
 
     stats = route_stats(coordinates, demands, routes)
@@ -202,31 +140,21 @@ def write_routes_txt(
 
         f.write(f"Number of routes: {len(routes)}\n")
         f.write(f"Total distance: {total_distance}\n\n")
-
         f.write("Routes:\n")
 
-        for route_number, (route, route_stat) in enumerate(
-            zip(routes, stats),
-            start=1
-        ):
+        for number, (route, stat) in enumerate(zip(routes, stats), start=1):
 
-            customers = " ".join(
-                f"C{idx}"
-                for idx in route
-            )
+            customers = " ".join(f"C{i}" for i in route)
 
             cluster_part = ""
 
             if route_clusters is not None:
-
-                cluster_id = route_clusters[route_number - 1]
-
-                cluster_part = f" (cluster {cluster_id + 1})"
+                cluster_part = f" (cluster {route_clusters[number - 1] + 1})"
 
             f.write(
-                f"Route {route_number}{cluster_part}: "
-                f"load {route_stat['load']}/{capacity}, "
-                f"distance {route_stat['distance']}: "
+                f"Route {number}{cluster_part}: "
+                f"load {stat['load']}/{capacity}, "
+                f"distance {stat['distance']}: "
                 f"CD0 {customers} CD0\n"
             )
 
@@ -234,34 +162,51 @@ def write_routes_txt(
 
 
 # ============================================================
-# PLOT HELPERS
+# .SOL OUTPUT (reference format)
+# ============================================================
+
+def write_sol(output_path, routes, total_distance):
+    """
+    Write routes in the reference .sol format:
+
+        Route #1: 9280 6557 1033
+        ...
+        Cost 4076853
+
+    Customers are numbered 1..n, so 0-based index idx is written as idx + 1.
+    """
+
+    with open(output_path, "w") as f:
+
+        for number, route in enumerate(routes, start=1):
+
+            customers = " ".join(str(i + 1) for i in route)
+
+            f.write(f"Route #{number}: {customers}\n")
+
+        f.write(f"Cost {int(round(total_distance))}\n")
+
+
+# ============================================================
+# PLOTTING
 # ============================================================
 
 def _group_colors(n):
     """
-    n distinct, saturated colours.
-
-    Up to 10 groups: tab10 (very distinct).
-    More groups: evenly spaced hues, shuffled so that neighbouring
-    cluster ids do not get similar colours.
+    n distinct colours. Up to 10 groups use tab10. More groups use evenly
+    spaced hues, shuffled so neighbouring cluster ids look different.
     """
 
     if n <= 10:
-
         return [plt.cm.tab10(i) for i in range(n)]
 
     hues = plt.cm.hsv(np.linspace(0, 1, n, endpoint=False))
 
-    rng = np.random.default_rng(0)
-
-    return hues[rng.permutation(n)]
+    return hues[np.random.default_rng(0).permutation(n)]
 
 
 def _cluster_hull(points):
-    """
-    Convex hull vertices of a point set, or None when the hull is
-    degenerate (fewer than 3 points, or all points collinear).
-    """
+    """Convex hull vertices, or None if the hull is degenerate."""
 
     if len(points) < 3:
         return None
@@ -274,9 +219,149 @@ def _cluster_hull(points):
     return points[hull.vertices]
 
 
-# ============================================================
-# PLOT ROUTES
-# ============================================================
+def _points(coordinates, indices):
+
+    return np.array([coordinates[i + 1] for i in indices])
+
+
+def _members_by_group(routes, route_groups, n_groups):
+
+    members = {group: [] for group in range(n_groups)}
+
+    for route, group in zip(routes, route_groups):
+        members[group].extend(route)
+
+    return members
+
+
+def _draw_cluster_areas(ax, coordinates, members, colors):
+
+    for group, indices in members.items():
+
+        if not indices:
+            continue
+
+        hull = _cluster_hull(_points(coordinates, indices))
+
+        if hull is None:
+            continue
+
+        ax.add_patch(
+            Polygon(
+                hull,
+                closed=True,
+                facecolor=to_rgba(colors[group], 0.35),
+                edgecolor=to_rgba(colors[group], 1.0),
+                linewidth=2.0,
+                zorder=0,
+            )
+        )
+
+
+def _draw_routes(ax, coordinates, routes):
+
+    depot = coordinates[0]
+
+    halo = [pe.withStroke(linewidth=2.6, foreground="white")]
+
+    for route in routes:
+
+        stops = [depot, *(coordinates[i + 1] for i in route), depot]
+
+        xs, ys = zip(*stops)
+
+        ax.plot(
+            xs,
+            ys,
+            color="black",
+            linewidth=0.9,
+            alpha=0.85,
+            zorder=2,
+            path_effects=halo,
+        )
+
+
+def _draw_customers_by_cluster(ax, coordinates, members, colors):
+
+    for group, indices in members.items():
+
+        if not indices:
+            continue
+
+        pts = _points(coordinates, indices)
+
+        ax.scatter(
+            pts[:, 0],
+            pts[:, 1],
+            s=50,
+            color=colors[group],
+            edgecolors="black",
+            linewidths=0.8,
+            zorder=5,
+        )
+
+
+def _draw_customers_plain(ax, coordinates, routes):
+
+    indices = [i for route in routes for i in route]
+
+    if not indices:
+        return
+
+    pts = _points(coordinates, indices)
+
+    ax.scatter(
+        pts[:, 0],
+        pts[:, 1],
+        s=30,
+        color="black",
+        edgecolors="white",
+        linewidths=0.5,
+        zorder=5,
+    )
+
+
+def _draw_depot(ax, depot):
+
+    ax.scatter(
+        depot[0],
+        depot[1],
+        s=260,
+        marker="*",
+        color="white",
+        edgecolors="black",
+        linewidths=1.5,
+        zorder=10,
+    )
+
+
+def _add_legend(ax, clustered):
+
+    handles = [
+        Line2D([0], [0], color="black", linewidth=1.2, label="Route"),
+        Line2D(
+            [0], [0], marker="o", color="w",
+            markerfacecolor="grey", markeredgecolor="black",
+            markersize=8, label="Customer (colour = cluster)" if clustered else "Customer",
+        ),
+        Line2D(
+            [0], [0], marker="*", color="w",
+            markerfacecolor="white", markeredgecolor="black",
+            markersize=14, label="Depot",
+        ),
+    ]
+
+    if clustered:
+        handles.append(
+            Patch(
+                facecolor=to_rgba("grey", 0.35),
+                edgecolor="grey",
+                label="Cluster area (shaded)",
+            )
+        )
+
+    ax.legend(handles=handles, fontsize=9, loc="best", framealpha=0.9)
+
 
 def plot_routes(
     coordinates,
@@ -289,182 +374,36 @@ def plot_routes(
     clustered=True,
 ):
     """
-    Plot solved routes.
+    Plot solved routes and save the figure.
 
-    routes:        list of routes (original customer indices)
+    routes:        list of routes (0-based customer indices)
     route_groups:  one group id per route (cluster id when clustered)
     n_groups:      number of distinct group ids
-    clustered:     True  -> shaded cluster areas, coloured customers
-                   False -> plain black routes and customers
+    clustered:     True shades cluster areas and colours customers by cluster;
+                   False draws all customers in black
     show:          open the figure window (blocks until closed)
     """
 
-    depot = coordinates[0]
-
-    colors = _group_colors(n_groups)
-
-    # Customers belonging to each group
-    group_customers = {g: [] for g in range(n_groups)}
-
-    for route, group in zip(routes, route_groups):
-        group_customers[group].extend(route)
-
     fig, ax = plt.subplots(figsize=(10, 10))
 
-    # --------------------------------------------------------
-    # 1. CLUSTER AREAS (background)
-    # --------------------------------------------------------
-
     if clustered:
 
-        for group in range(n_groups):
+        colors = _group_colors(n_groups)
 
-            if not group_customers[group]:
-                continue
+        members = _members_by_group(routes, route_groups, n_groups)
 
-            points = np.array([
-                coordinates[idx + 1]
-                for idx in group_customers[group]
-            ])
+        _draw_cluster_areas(ax, coordinates, members, colors)
 
-            hull_points = _cluster_hull(points)
-
-            if hull_points is None:
-                continue
-
-            ax.add_patch(
-                Polygon(
-                    hull_points,
-                    closed=True,
-                    facecolor=to_rgba(colors[group], 0.35),
-                    edgecolor=to_rgba(colors[group], 1.0),
-                    linewidth=2.0,
-                    zorder=0
-                )
-            )
-
-    # --------------------------------------------------------
-    # 2. ROUTES (black, with a white halo for contrast)
-    # --------------------------------------------------------
-
-    halo = [pe.withStroke(linewidth=2.6, foreground="white")]
-
-    for route in routes:
-
-        x_values = [depot[0]]
-        y_values = [depot[1]]
-
-        for idx in route:
-
-            x, y = coordinates[idx + 1]
-
-            x_values.append(x)
-            y_values.append(y)
-
-        x_values.append(depot[0])
-        y_values.append(depot[1])
-
-        ax.plot(
-            x_values,
-            y_values,
-            color="black",
-            linewidth=0.9,
-            alpha=0.85,
-            zorder=2,
-            path_effects=halo
-        )
-
-    # --------------------------------------------------------
-    # 3. CUSTOMERS (coloured by cluster, black outline)
-    # --------------------------------------------------------
+    _draw_routes(ax, coordinates, routes)
 
     if clustered:
-
-        for group in range(n_groups):
-
-            if not group_customers[group]:
-                continue
-
-            points = np.array([
-                coordinates[idx + 1]
-                for idx in group_customers[group]
-            ])
-
-            ax.scatter(
-                points[:, 0],
-                points[:, 1],
-                s=50,
-                color=colors[group],
-                edgecolors="black",
-                linewidths=0.8,
-                zorder=5
-            )
-
+        _draw_customers_by_cluster(ax, coordinates, members, colors)
     else:
+        _draw_customers_plain(ax, coordinates, routes)
 
-        all_customers = [
-            idx
-            for route in routes
-            for idx in route
-        ]
+    _draw_depot(ax, coordinates[0])
 
-        if all_customers:
-
-            points = np.array([
-                coordinates[idx + 1]
-                for idx in all_customers
-            ])
-
-            ax.scatter(
-                points[:, 0],
-                points[:, 1],
-                s=30,
-                color="black",
-                edgecolors="white",
-                linewidths=0.5,
-                zorder=5
-            )
-
-    # --------------------------------------------------------
-    # 4. DEPOT
-    # --------------------------------------------------------
-
-    ax.scatter(
-        depot[0],
-        depot[1],
-        s=260,
-        marker="*",
-        edgecolors="black",
-        linewidths=1.5,
-        color="white",
-        zorder=10
-    )
-
-    # --------------------------------------------------------
-    # 5. LEGEND (fixed entries, never one per cluster)
-    # --------------------------------------------------------
-
-    handles = [
-        Line2D([0], [0], color="black", linewidth=1.2, label="Route"),
-        Line2D([0], [0], marker="o", color="w",
-               markerfacecolor="grey", markeredgecolor="black",
-               markersize=8, label="Customer (colour = cluster)"),
-        Line2D([0], [0], marker="*", color="w",
-               markerfacecolor="white", markeredgecolor="black",
-               markersize=14, label="Depot"),
-    ]
-
-    if clustered:
-
-        handles.append(
-            Patch(
-                facecolor=to_rgba("grey", 0.35),
-                edgecolor="grey",
-                label="Cluster area (shaded)"
-            )
-        )
-
-    ax.legend(handles=handles, fontsize=9, loc="best", framealpha=0.9)
+    _add_legend(ax, clustered)
 
     ax.set_title(title)
     ax.set_xlabel("X coordinate")
@@ -472,13 +411,8 @@ def plot_routes(
     ax.set_aspect("equal", adjustable="box")
     ax.grid(alpha=0.2)
 
-    plt.tight_layout()
-
-    plt.savefig(
-        output_file,
-        dpi=200,
-        bbox_inches="tight"
-    )
+    fig.tight_layout()
+    fig.savefig(output_file, dpi=200, bbox_inches="tight")
 
     if show:
         plt.show()

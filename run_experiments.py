@@ -1,40 +1,57 @@
 """
 Run everything from here.
 
-Change the SETTINGS block below, then run this file.
+Change the SETTINGS block, then run this file.
 
-Every run is saved separately:
-    - its own row in results\\routing_overview.xlsx (identified by run_id)
-    - its own .png and .txt files, with the run_id in the file name
+Cluster sizes:
+    k = ceil(n / TARGET_CUSTOMERS_PER_CLUSTER), where n is the number of
+    customers, limited to between 1 and n. The customers are then clustered
+    with the chosen method. Empty clusters are dropped, so the number of
+    clusters formed can be lower than k.
 
-Output layout (per run):
-    results\\{instance}\\{total_hgs_time}s\\
-        {instance}_{algorithm}_k{n_clusters}_{total_hgs_time}s_{run_id}_routes.png
-        {instance}_{algorithm}_k{n_clusters}_{total_hgs_time}s_{run_id}_routes.txt
-    results\\{instance}\\{hgs_time}s\\          (regular HGS, no cluster level)
-        {instance}_HGS_{hgs_time}s_{run_id}_routes.png / .txt
+Time budget:
+    TOTAL_TIME is the total solver runtime of one run. Clustered runs
+    split it across their clusters by TIME_SHARE_BASIS ("demand" or
+    "customers"). The whole-instance run gets all of TOTAL_TIME.
 
-If two runs with identical settings finish within the same second, the
-second one gets a _2 (then _3, ...) suffix, so nothing is overwritten.
+Output per run (a _2, _3, ... suffix is added if a name already exists):
+    results/{instance}/{TOTAL_TIME}s/
+        {base}_routes.png      plot
+        {base}_routes.txt      notes: settings, cluster quality, routes
+        {base}.sol             routes in the reference .sol format
+        {base}_clusters.csv    one row per cluster
+    results/routing_overview.xlsx    one row per run: settings and distance
 
-Modules:
-    instance_io.py  - reading, route statistics, text output, plotting
-    clustering.py   - sweep, kmeans, agglomerative
-    hgs12.py        - PyVRP (HGS) solving, per cluster and whole instance
-    overview.py     - Excel overview
+Console:
+    A settings summary at the start, then for each instance a header with
+    its size, and for each run a START block (setup and clustering quality)
+    and a DONE block (routes, routes per customer, distance, time).
+    routes per customer = number of routes / number of customers.
 """
 
+import os
+
+# Must be set before scikit-learn is imported. Without it, joblib tries to
+# count physical cores by running wmic, which newer Windows versions lack.
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", str(os.cpu_count() or 1))
+
+import csv
+import time
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
+
+from clustering import cluster_count, clustering_quality, make_clusters
+from ILS import solve_clusters, solve_whole_instance
 from instance_io import (
-    read_vrp,
     calculate_number_of_vehicles,
-    write_routes_txt,
     plot_routes,
+    read_vrp,
+    route_stats,
+    write_routes_txt,
+    write_sol,
 )
-from clustering import ALGORITHM_FUNCTIONS
-from hgs import solve_all_clusters, solve_whole_instance
 from overview import update_overview
 
 
@@ -52,31 +69,81 @@ RESULT_ROOT = Path(
 
 OVERVIEW_FILE = RESULT_ROOT / "routing_overview.xlsx"
 
-# Random seed (clustering and PyVRP)
-SEED = None  # None = random seed, int = fixed seed for reproducibility
+# Total solver runtime per run (s), shared between clusters.
+TOTAL_TIME = 20
 
-# ----- Regular HGS (whole instance) -----
-RUN_REGULAR_HGS = True
-REGULAR_HGS_TIME = 1200          # total HGS runtime per instance (s)
+# Every configuration runs once per seed
+SEEDS = [101]
 
-# ----- Clustered HGS -----
-RUN_CLUSTERED = False
+RUN_CLUSTERED = True
+RUN_WHOLE_INSTANCE = False
 
-# Number of clusters. One clustered run per value in the list,
-# for every algorithm in CLUSTER_ALGORITHMS. E.g. [4, 6, 50].
-N_CLUSTERS = [20]
+# Target number of customers per cluster (m). Clusters = ceil(n / m).
+TARGET_CUSTOMERS_PER_CLUSTER = [1000]
 
-# Clustering algorithms to run: "sweep", "kmeans", "agglomerative"
-CLUSTER_ALGORITHMS = [
+# Clustering methods: "sweep", "kmeans", "kmeans_weighted", "agglomerative"
+CLUSTER_METHODS = [
     "sweep",
     "kmeans",
+    "kmeans_weighted",
     "agglomerative",
 ]
 
-CLUSTER_HGS_TIME = 60          # HGS runtime PER CLUSTER (s)
+# Share of TOTAL_TIME per cluster: "demand" or "customers"
+TIME_SHARE_BASIS = "demand"
 
-# ----- Display -----
-SHOW_PLOTS = False            # True = open each plot window (blocks)
+SHOW_PLOTS = False
+
+
+# ============================================================
+# CONSOLE
+# ============================================================
+
+INDENT = " " * 10
+LABEL_WIDTH = 16
+RULE = "=" * 72
+
+
+def stamp(message):
+    """Print a message prefixed with the current clock time."""
+
+    print(f"{datetime.now():%H:%M:%S}  {message}")
+
+
+def kv(label, value):
+    """One aligned 'label  value' line for a console block."""
+
+    return f"{label:<{LABEL_WIDTH}}{value}"
+
+
+def show(lines):
+    """Print lines indented under the last stamped message."""
+
+    for line in lines:
+        print(f"{INDENT}{line}")
+
+
+def fmt(value, digits=3):
+    """Format a number for printing, or 'n/a' when it is None."""
+
+    return "n/a" if value is None else f"{value:.{digits}f}"
+
+
+def print_settings():
+
+    targets = ", ".join(str(t) for t in TARGET_CUSTOMERS_PER_CLUSTER)
+
+    print(RULE)
+    stamp("SETTINGS")
+    show([
+        kv("seeds", ", ".join(str(s) for s in SEEDS)),
+        kv("total time", f"{TOTAL_TIME} s per run"),
+        kv("time share", TIME_SHARE_BASIS),
+        kv("methods", ", ".join(CLUSTER_METHODS) if RUN_CLUSTERED else "none"),
+        kv("targets", f"{targets} customers/cluster" if RUN_CLUSTERED else "none"),
+        kv("whole instance", "yes" if RUN_WHOLE_INSTANCE else "no"),
+    ])
+    print(RULE)
 
 
 # ============================================================
@@ -85,31 +152,108 @@ SHOW_PLOTS = False            # True = open each plot window (blocks)
 
 def new_run_id():
     """Timestamp identifying one run (to the second)."""
+
     return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def run_folder(filepath):
+
+    return RESULT_ROOT / filepath.stem / f"{TOTAL_TIME}s"
 
 
 def unique_base_name(folder, base_name):
     """
-    Return base_name, or base_name_2, base_name_3, ... if files with
-    that name already exist in folder. Guarantees no run is overwritten.
+    Return base_name, or base_name_2, base_name_3, ... if output files
+    with that name already exist in folder.
     """
 
     candidate = base_name
     counter = 2
 
-    while (
-        (folder / f"{candidate}_routes.png").exists()
-        or (folder / f"{candidate}_routes.txt").exists()
+    while any(
+        (folder / f"{candidate}{suffix}").exists()
+        for suffix in ("_routes.png", "_routes.txt", ".sol", "_clusters.csv")
     ):
-
         candidate = f"{base_name}_{counter}"
         counter += 1
 
     return candidate
 
 
-def _check_distances(stats, total_distance):
-    """Warn if per-route distances do not add up to the solver total."""
+def cluster_time_limits(clusters, demands):
+    """
+    Split TOTAL_TIME across clusters in proportion to TIME_SHARE_BASIS.
+    The limits add up to TOTAL_TIME.
+    """
+
+    if TIME_SHARE_BASIS == "demand":
+        weights = [
+            int(demands[np.asarray(cluster) + 1].sum())
+            for cluster in clusters
+        ]
+
+    elif TIME_SHARE_BASIS == "customers":
+        weights = [len(cluster) for cluster in clusters]
+
+    else:
+        raise ValueError(
+            f"TIME_SHARE_BASIS must be 'demand' or 'customers', "
+            f"got '{TIME_SHARE_BASIS}'."
+        )
+
+    weights = np.asarray(weights, dtype=float)
+
+    if weights.sum() == 0:
+        weights = np.ones(len(clusters))
+
+    return (TOTAL_TIME * weights / weights.sum()).tolist()
+
+
+def routes_quality(coordinates, demands, capacity, routes, route_clusters, per_cluster):
+    """
+    Quality of the routes. Adds routes, min_routes, route_overhead and
+    distance to each row of per_cluster (in place). Returns a summary dict.
+    """
+
+    stats = route_stats(coordinates, demands, routes)
+
+    routes_per_cluster = [0] * len(per_cluster)
+    distance_per_cluster = [0] * len(per_cluster)
+
+    for cluster_id, stat in zip(route_clusters, stats):
+        routes_per_cluster[cluster_id] += 1
+        distance_per_cluster[cluster_id] += stat["distance"]
+
+    for label, row in enumerate(per_cluster):
+
+        min_routes = int(np.ceil(row["demand"] / capacity))
+
+        row["routes"] = routes_per_cluster[label]
+        row["min_routes"] = min_routes
+        row["route_overhead"] = routes_per_cluster[label] - min_routes
+        row["distance"] = distance_per_cluster[label]
+
+    return {
+        "route_overhead": sum(row["route_overhead"] for row in per_cluster),
+        "distance": sum(distance_per_cluster),
+    }
+
+
+def write_cluster_csv(path, per_cluster):
+    """One row per cluster, with before-solve and after-solve measures."""
+
+    if not per_cluster:
+        return
+
+    with open(path, "w", newline="") as f:
+
+        writer = csv.DictWriter(f, fieldnames=list(per_cluster[0]))
+        writer.writeheader()
+        writer.writerows(per_cluster)
+
+
+def check_distances(stats, total_distance):
+    """Warn if the per-route distances do not add up to the solver total."""
 
     check = sum(s["distance"] for s in stats)
 
@@ -120,216 +264,32 @@ def _check_distances(stats, total_distance):
         )
 
 
-# ============================================================
-# RUN CLUSTERED HGS FOR ONE INSTANCE
-# ============================================================
+def save_outputs(
+    folder,
+    base_name,
+    title,
+    coordinates,
+    demands,
+    capacity,
+    routes,
+    total_distance,
+    header_lines,
+    route_groups=None,
+    n_groups=1,
+):
+    """Write the plot, the routes text file and the .sol file for one run."""
 
-def run_clustered(filepath, coordinates, demands, capacity):
+    clustered = route_groups is not None
 
-    rows = []
-
-    for algorithm_name in CLUSTER_ALGORITHMS:
-
-        if algorithm_name not in ALGORITHM_FUNCTIONS:
-            raise ValueError(
-                f"Unknown clustering algorithm: {algorithm_name}. "
-                f"Available: {list(ALGORITHM_FUNCTIONS)}"
-            )
-
-        algorithm_func = ALGORITHM_FUNCTIONS[algorithm_name]
-
-        for n_clusters in N_CLUSTERS:
-
-            print()
-            print(f"--- {algorithm_name} | n_clusters = {n_clusters} ---")
-
-            # 1. CLUSTER
-            clusters = algorithm_func(
-                coordinates,
-                demands,
-                capacity,
-                n_clusters,
-                SEED
-            )
-
-            num_formed = len(clusters)
-
-            cluster_demands = [
-                int(demands[[idx + 1 for idx in cluster]].sum())
-                for cluster in clusters
-            ]
-
-            total_hgs_time = num_formed * CLUSTER_HGS_TIME
-
-            print(f"Clusters formed: {num_formed}")
-            print(
-                f"Cluster demand min/max: "
-                f"{min(cluster_demands)} / {max(cluster_demands)} "
-                f"(capacity {capacity})"
-            )
-
-            # 2. HGS PER CLUSTER
-            print(
-                f"Solving {num_formed} cluster(s) with HGS "
-                f"({CLUSTER_HGS_TIME}s each, {total_hgs_time}s total)..."
-            )
-
-            routes, route_clusters, total_distance = solve_all_clusters(
-                coordinates,
-                demands,
-                clusters,
-                capacity,
-                time_limit=CLUSTER_HGS_TIME,
-                seed=SEED
-            )
-
-            print(f"Routes: {len(routes)}")
-            print(f"Total distance: {total_distance}")
-
-            # 3. RUN ID, FOLDER AND UNIQUE FILE NAME
-            run_id = new_run_id()
-
-            folder = (
-                RESULT_ROOT
-                / filepath.stem
-                / f"{total_hgs_time}s"
-            )
-
-            folder.mkdir(parents=True, exist_ok=True)
-
-            base_name = unique_base_name(
-                folder,
-                f"{filepath.stem}_{algorithm_name}"
-                f"_k{n_clusters}_{total_hgs_time}s_{run_id}"
-            )
-
-            title = (
-                f"{filepath.stem} - {algorithm_name} "
-                f"(k = {n_clusters}, {total_hgs_time}s total HGS)\n"
-                f"{num_formed} clusters | {len(routes)} routes | "
-                f"distance = {total_distance}"
-            )
-
-            # 4. OUTPUT
-            plot_routes(
-                coordinates,
-                routes,
-                route_clusters,
-                num_formed,
-                title,
-                folder / f"{base_name}_routes.png",
-                show=SHOW_PLOTS,
-                clustered=True,
-            )
-
-            stats = write_routes_txt(
-                folder / f"{base_name}_routes.txt",
-                coordinates,
-                demands,
-                capacity,
-                routes,
-                total_distance,
-                route_clusters=route_clusters,
-                header_lines=[
-                    f"Run ID: {run_id}",
-                    f"Instance: {filepath.name}",
-                    f"Method: clustered HGS ({algorithm_name})",
-                    f"Capacity: {capacity}",
-                    f"Clusters requested: {n_clusters}",
-                    f"Clusters formed: {num_formed}",
-                    f"HGS time per cluster (s): {CLUSTER_HGS_TIME}",
-                    f"Total HGS time (s): {total_hgs_time}",
-                    f"Seed: {SEED}",
-                ]
-            )
-
-            _check_distances(stats, total_distance)
-
-            row = {
-                "run_id": run_id,
-                "instance": filepath.stem,
-                "method": "clustered_hgs",
-                "algorithm": algorithm_name,
-                "n_clusters_requested": n_clusters,
-                "n_clusters_formed": num_formed,
-                "num_routes": len(routes),
-                "total_distance": total_distance,
-                "min_cluster_demand": min(cluster_demands),
-                "max_cluster_demand": max(cluster_demands),
-                "max_cluster_load_pct": round(
-                    100 * max(cluster_demands) / capacity, 1
-                ),
-                "hgs_time_per_cluster_s": CLUSTER_HGS_TIME,
-                "total_hgs_time_s": total_hgs_time,
-                "seed": SEED,
-                "output_folder": str(folder),
-                "file_name": base_name,
-            }
-
-            rows.append(row)
-
-            update_overview(OVERVIEW_FILE, [row])
-            print(f"Run ID: {run_id}")
-            print(f"Saved to: {folder}")
-
-    return rows
-
-
-# ============================================================
-# RUN REGULAR HGS FOR ONE INSTANCE
-# ============================================================
-
-def run_regular(filepath, coordinates, demands, capacity):
-
-    print()
-    print("--- regular HGS (whole instance) ---")
-    print(f"Running HGS for {REGULAR_HGS_TIME} seconds...")
-
-    result = solve_whole_instance(
-        filepath,
-        time_limit=REGULAR_HGS_TIME,
-        seed=SEED
-    )
-
-    routes = result["routes"]
-    total_distance = result["distance"]
-
-    print(f"Routes: {len(routes)}")
-    print(f"Distance: {total_distance}")
-    print(f"Feasible: {result['feasible']}")
-
-    # 1. RUN ID, FOLDER AND UNIQUE FILE NAME
-    run_id = new_run_id()
-
-    folder = (
-        RESULT_ROOT
-        / filepath.stem
-        / f"{REGULAR_HGS_TIME}s"
-    )
-
-    folder.mkdir(parents=True, exist_ok=True)
-
-    base_name = unique_base_name(
-        folder,
-        f"{filepath.stem}_HGS_{REGULAR_HGS_TIME}s_{run_id}"
-    )
-
-    title = (
-        f"{filepath.stem} - regular HGS "
-        f"({REGULAR_HGS_TIME}s total)\n"
-        f"{len(routes)} routes | distance = {total_distance}"
-    )
-
-    # 2. OUTPUT
     plot_routes(
         coordinates,
         routes,
-        [0] * len(routes),
-        1,
+        route_groups if clustered else [0] * len(routes),
+        n_groups,
         title,
         folder / f"{base_name}_routes.png",
         show=SHOW_PLOTS,
-        clustered=False,
+        clustered=clustered,
     )
 
     stats = write_routes_txt(
@@ -339,84 +299,316 @@ def run_regular(filepath, coordinates, demands, capacity):
         capacity,
         routes,
         total_distance,
-        header_lines=[
-            f"Run ID: {run_id}",
-            f"Instance: {filepath.name}",
-            "Method: regular HGS (whole instance)",
-            f"Capacity: {capacity}",
-            f"Total HGS time (s): {REGULAR_HGS_TIME}",
-            f"Runtime reported (s): {result['runtime']:.2f}",
-            f"Feasible: {result['feasible']}",
-            f"Seed: {SEED}",
-        ]
+        route_clusters=route_groups,
+        header_lines=header_lines,
     )
 
-    _check_distances(stats, total_distance)
+    write_sol(folder / f"{base_name}.sol", routes, total_distance)
+
+    check_distances(stats, total_distance)
+
+
+# ============================================================
+# CLUSTERED RUN
+# ============================================================
+
+def run_clustering(
+    filepath, coordinates, demands, capacity, method, target_customers, seed, progress
+):
+
+    started = time.perf_counter()
+    customers = len(coordinates) - 1
+    requested = cluster_count(customers, target_customers)
+
+    print()
+    stamp(
+        f"{progress} START  clustered | {method} | seed {seed} | "
+        f"target {target_customers} customers/cluster"
+    )
+
+    clusters = make_clusters(coordinates, demands, target_customers, method, seed)
+
+    n_clusters = len(clusters)
+
+    sizes = [len(cluster) for cluster in clusters]
+
+    cluster_demands = [
+        int(demands[np.asarray(cluster) + 1].sum())
+        for cluster in clusters
+    ]
+
+    time_limits = cluster_time_limits(clusters, demands)
+
+    before, per_cluster = clustering_quality(
+        coordinates, demands, clusters, target_customers, seed
+    )
+
+    if n_clusters == requested:
+        clusters_text = f"{n_clusters}"
+    else:
+        clusters_text = f"{n_clusters} (requested {requested}, empty dropped)"
+
+    show([
+        kv("clusters", clusters_text),
+        kv("customers", f"{min(sizes)} to {max(sizes)} per cluster"),
+        kv("demand", f"{min(cluster_demands)} to {max(cluster_demands)} "
+                     f"per cluster (capacity {capacity})"),
+        kv("solver time", f"{min(time_limits):.1f} to {max(time_limits):.1f} s "
+                          f"per cluster ({TIME_SHARE_BASIS} share, "
+                          f"{TOTAL_TIME} s total)"),
+        kv("nearest share", fmt(before["nearest_centroid_share"])),
+        kv("silhouette", fmt(before["silhouette"])),
+        kv("demand CV", fmt(before["demand_cv"])),
+        kv("solving", "..."),
+    ])
+
+    routes, route_clusters, total_distance = solve_clusters(
+        coordinates,
+        demands,
+        clusters,
+        capacity,
+        time_limits=time_limits,
+        seed=seed,
+    )
+
+    after = routes_quality(
+        coordinates, demands, capacity, routes, route_clusters, per_cluster
+    )
+
+    for row, time_limit in zip(per_cluster, time_limits):
+        row["time_limit_s"] = round(time_limit, 2)
+
+    run_id = new_run_id()
+
+    folder = run_folder(filepath)
+    folder.mkdir(parents=True, exist_ok=True)
+
+    base_name = unique_base_name(
+        folder,
+        f"{filepath.stem}_{method}_cust{target_customers}_k{n_clusters}_{run_id}",
+    )
+
+    title = (
+        f"{filepath.stem} - {method} "
+        f"(target {target_customers} customers/cluster, k = {n_clusters}, "
+        f"{TOTAL_TIME}s total)\n"
+        f"{len(routes)} routes | distance = {total_distance} | seed {seed}"
+    )
+
+    header_lines = [
+        f"Run ID: {run_id}",
+        f"Instance: {filepath.name}",
+        f"Method: clustered ({method})",
+        f"Capacity: {capacity}",
+        f"Target customers per cluster: {target_customers}",
+        f"Clusters: requested {requested}, formed {n_clusters}",
+        f"Customers per cluster (min/max): {min(sizes)} / {max(sizes)}",
+        f"Demand per cluster (min/max): {min(cluster_demands)} / {max(cluster_demands)}",
+        f"Time share basis: {TIME_SHARE_BASIS}",
+        f"Solver time per cluster (s, min/max): "
+        f"{min(time_limits):.2f} / {max(time_limits):.2f}",
+        f"Total solver time (s): {TOTAL_TIME}",
+        f"Nearest-centroid share: {before['nearest_centroid_share']}",
+        f"Silhouette: {before['silhouette']}",
+        f"Demand CV: {before['demand_cv']}",
+        f"Route overhead vs cluster lower bounds: {after['route_overhead']}",
+        f"Seed: {seed}",
+    ]
+
+    save_outputs(
+        folder,
+        base_name,
+        title,
+        coordinates,
+        demands,
+        capacity,
+        routes,
+        total_distance,
+        header_lines,
+        route_groups=route_clusters,
+        n_groups=n_clusters,
+    )
+
+    write_cluster_csv(folder / f"{base_name}_clusters.csv", per_cluster)
 
     row = {
         "run_id": run_id,
         "instance": filepath.stem,
-        "method": "regular_hgs",
-        "algorithm": "-",
-        "n_clusters_requested": None,
-        "n_clusters_formed": None,
-        "num_routes": len(routes),
+        "method": "clustered",
+        "algorithm": method,
+        "target_customers_per_cluster": target_customers,
+        "time_share_basis": TIME_SHARE_BASIS,
+        "n_clusters_requested": requested,
+        "n_clusters_formed": n_clusters,
+        "min_cluster_customers": min(sizes),
+        "max_cluster_customers": max(sizes),
+        "min_cluster_demand": min(cluster_demands),
+        "max_cluster_demand": max(cluster_demands),
+        "max_cluster_load_pct": round(100 * max(cluster_demands) / capacity, 1),
+        "demand_cv": before["demand_cv"],
+        "nearest_centroid_share": before["nearest_centroid_share"],
+        "silhouette": before["silhouette"],
+        "mean_customer_radius": before["mean_customer_radius"],
         "total_distance": total_distance,
-        "min_cluster_demand": None,
-        "max_cluster_demand": None,
-        "max_cluster_load_pct": None,
-        "hgs_time_per_cluster_s": None,
-        "total_hgs_time_s": REGULAR_HGS_TIME,
-        "seed": SEED,
+        "avg_time_per_cluster_s": round(TOTAL_TIME / n_clusters, 2),
+        "total_time_s": TOTAL_TIME,
+        "seed": seed,
         "output_folder": str(folder),
         "file_name": base_name,
     }
 
     update_overview(OVERVIEW_FILE, [row])
-    print(f"Run ID: {run_id}")
-    print(f"Saved to: {folder}")
 
-    return [row]
+    elapsed = time.perf_counter() - started
+
+    stamp(f"{progress} DONE   clustered | {method} | seed {seed} | {elapsed:.0f} s")
+    show([
+        kv("routes", len(routes)),
+        kv("routes/customer", f"{len(routes) / customers:.4f}"),
+        kv("distance", total_distance),
+        kv("saved as", base_name),
+    ])
+
+    return row
 
 
 # ============================================================
-# RUN ONE INSTANCE
+# WHOLE-INSTANCE RUN
 # ============================================================
 
-def run_instance(filepath):
+def run_whole_instance(filepath, coordinates, demands, capacity, seed, progress):
+
+    started = time.perf_counter()
+    customers = len(coordinates) - 1
 
     print()
-    print("=" * 60)
-    print(f"INSTANCE: {filepath.name}")
-    print("=" * 60)
+    stamp(f"{progress} START  whole instance | seed {seed} | {TOTAL_TIME} s")
+
+    result = solve_whole_instance(filepath, time_limit=TOTAL_TIME, seed=seed)
+
+    routes = result["routes"]
+    total_distance = result["distance"]
+
+    run_id = new_run_id()
+
+    folder = run_folder(filepath)
+    folder.mkdir(parents=True, exist_ok=True)
+
+    base_name = unique_base_name(
+        folder,
+        f"{filepath.stem}_whole_{TOTAL_TIME}s_{run_id}",
+    )
+
+    title = (
+        f"{filepath.stem} - whole instance ({TOTAL_TIME}s total)\n"
+        f"{len(routes)} routes | distance = {total_distance} | seed {seed}"
+    )
+
+    header_lines = [
+        f"Run ID: {run_id}",
+        f"Instance: {filepath.name}",
+        "Method: whole instance",
+        f"Capacity: {capacity}",
+        f"Total solver time (s): {TOTAL_TIME}",
+        f"Runtime reported (s): {result['runtime']:.2f}",
+        f"Feasible: {result['feasible']}",
+        f"Seed: {seed}",
+    ]
+
+    save_outputs(
+        folder,
+        base_name,
+        title,
+        coordinates,
+        demands,
+        capacity,
+        routes,
+        total_distance,
+        header_lines,
+    )
+
+    row = {
+        "run_id": run_id,
+        "instance": filepath.stem,
+        "method": "whole_instance",
+        "algorithm": "-",
+        "total_distance": total_distance,
+        "total_time_s": TOTAL_TIME,
+        "seed": seed,
+        "output_folder": str(folder),
+        "file_name": base_name,
+    }
+
+    update_overview(OVERVIEW_FILE, [row])
+
+    elapsed = time.perf_counter() - started
+
+    stamp(f"{progress} DONE   whole instance | seed {seed} | {elapsed:.0f} s")
+    show([
+        kv("routes", len(routes)),
+        kv("routes/customer", f"{len(routes) / customers:.4f}"),
+        kv("distance", total_distance),
+        kv("feasible", result["feasible"]),
+        kv("saved as", base_name),
+    ])
+
+    return row
+
+
+# ============================================================
+# ONE INSTANCE
+# ============================================================
+
+def run_instance(filepath, index, count):
 
     coordinates, demands, capacity = read_vrp(filepath)
 
-    print(f"Customers: {len(coordinates) - 1}")
-    print(f"Total demand: {demands[1:].sum()}")
-    print(f"Vehicle capacity (from file): {capacity}")
-    print(
-        f"Minimum vehicles: "
-        f"{calculate_number_of_vehicles(demands[1:], capacity)}"
-    )
+    customers = len(coordinates) - 1
+    total_demand = int(demands[1:].sum())
+    min_vehicles = calculate_number_of_vehicles(demands[1:], capacity)
+
+    # One entry per run for this instance, in the order they will run
+    runs = []
 
     if RUN_CLUSTERED:
+        for seed in SEEDS:
+            for method in CLUSTER_METHODS:
+                for target_customers in TARGET_CUSTOMERS_PER_CLUSTER:
+                    runs.append(("clustered", seed, method, target_customers))
 
-        run_clustered(
-            filepath,
-            coordinates,
-            demands,
-            capacity
-        )
+    if RUN_WHOLE_INSTANCE:
+        for seed in SEEDS:
+            runs.append(("whole", seed, None, None))
 
-    if RUN_REGULAR_HGS:
+    print()
+    print(RULE)
+    stamp(f"INSTANCE {index}/{count}  {filepath.name}")
+    show([
+        kv("customers", customers),
+        kv("total demand", total_demand),
+        kv("capacity", capacity),
+        kv("min vehicles", min_vehicles),
+        kv("runs", len(runs)),
+    ])
+    print(RULE)
 
-        run_regular(
-            filepath,
-            coordinates,
-            demands,
-            capacity
-        )
+    for number, (kind, seed, method, target_customers) in enumerate(runs, start=1):
+
+        progress = f"[{number}/{len(runs)}]"
+
+        if kind == "clustered":
+            run_clustering(
+                filepath, coordinates, demands, capacity,
+                method, target_customers, seed, progress,
+            )
+
+        else:
+            run_whole_instance(
+                filepath, coordinates, demands, capacity, seed, progress,
+            )
+
+    print()
+    stamp(f"INSTANCE {index}/{count} finished")
 
 
 # ============================================================
@@ -425,32 +617,29 @@ def run_instance(filepath):
 
 def main():
 
-    if not (RUN_CLUSTERED or RUN_REGULAR_HGS):
-        print("Nothing to run: RUN_CLUSTERED and RUN_REGULAR_HGS are both False.")
+    if not (RUN_CLUSTERED or RUN_WHOLE_INSTANCE):
+        print("Nothing to run: RUN_CLUSTERED and RUN_WHOLE_INSTANCE are both False.")
         return
 
     RESULT_ROOT.mkdir(parents=True, exist_ok=True)
 
-    files = sorted(
-        INSTANCE_DIR.glob("*.vrp")
-    )
+    files = sorted(INSTANCE_DIR.glob("*.vrp"))
 
     if not files:
-
         print("No .vrp files found.")
-
         return
 
-    print(f"Found {len(files)} instances.")
+    print_settings()
+    stamp(f"Found {len(files)} instances in {INSTANCE_DIR.name}")
 
-    for filepath in files:
-
-        run_instance(filepath)
+    for index, filepath in enumerate(files, start=1):
+        run_instance(filepath, index, len(files))
 
     print()
-    print("=" * 60)
-    print(f"ALL INSTANCES FINISHED. Overview: {OVERVIEW_FILE}")
-    print("=" * 60)
+    print(RULE)
+    stamp("ALL INSTANCES FINISHED")
+    show([kv("overview", str(OVERVIEW_FILE))])
+    print(RULE)
 
 
 if __name__ == "__main__":
