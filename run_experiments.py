@@ -43,7 +43,7 @@ from pathlib import Path
 import numpy as np
 
 from clustering import cluster_count, clustering_quality, make_clusters
-from ILS import solve_clusters, solve_whole_instance
+from ails_solver import solve_cluster, solve_whole_instance
 from instance_io import (
     calculate_number_of_vehicles,
     plot_routes,
@@ -60,20 +60,20 @@ from overview import update_overview
 # ============================================================
 
 INSTANCE_DIR = Path(
-    r"C:\Users\20235296\Documents\4de Jaar IE\BEP\data\instances\XL\A - test"
+    r"C:\XL"
 )
 
 RESULT_ROOT = Path(
-    r"C:\Users\20235296\Documents\4de Jaar IE\BEP\results"
+    r"C:\results"
 )
 
 OVERVIEW_FILE = RESULT_ROOT / "routing_overview.xlsx"
 
 # Total solver runtime per run (s), shared between clusters.
-TOTAL_TIME = 20
+TOTAL_TIME = 21
 
 # Every configuration runs once per seed
-SEEDS = [101]
+SEEDS = [0]
 
 RUN_CLUSTERED = True
 RUN_WHOLE_INSTANCE = False
@@ -83,14 +83,14 @@ TARGET_CUSTOMERS_PER_CLUSTER = [1000]
 
 # Clustering methods: "sweep", "kmeans", "kmeans_weighted", "agglomerative"
 CLUSTER_METHODS = [
-    "sweep",
-    "kmeans",
-    "kmeans_weighted",
-    "agglomerative",
+    "sweep"
+    #"kmeans",
+    #"kmeans_weighted",
+    #"agglomerative",
 ]
 
 # Share of TOTAL_TIME per cluster: "demand" or "customers"
-TIME_SHARE_BASIS = "demand"
+TIME_SHARE_BASIS = "customers"
 
 SHOW_PLOTS = False
 
@@ -362,7 +362,7 @@ def run_clustering(
         kv("solving", "..."),
     ])
 
-    routes, route_clusters, total_distance = solve_clusters(
+    routes, route_clusters, total_distance = solve_cluster(
         coordinates,
         demands,
         clusters,
