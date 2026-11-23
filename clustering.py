@@ -1,20 +1,18 @@
 """
-Cluster formation for splitting a CVRP into subproblems.
+Clustering methods and cluster formation for splitting a CVRP into subproblems.
 
-    make_clusters(coordinates, demands, target_customers, method, seed=None)
+    cluster_count(num_customers, min_vehicles, sizing, value)
+    make_clusters(coordinates, demands, n_clusters, method, seed=None)
 
-    1. The number of clusters is
-           k = ceil(n / target_customers)
-       limited to between 1 and the number of customers n.
-    2. The chosen method clusters all customers into k clusters.
-
-target_customers is the number of customers one cluster should hold, m.
+Cluster count
+    sizing="routes"     k = ceil(min_vehicles / value)     value = routes per cluster
+    sizing="customers"  k = ceil(num_customers / value)    value = customers per cluster
+    k is kept between 1 and the number of customers.
 
 Methods:
-    sweep            demand-aware: contiguous angular sectors of equal demand
-    kmeans           distance-based, ignores demand
-    kmeans_weighted  distance-based, each customer weighted by its demand
-    agglomerative    distance-based, ignores demand
+    sweep            demand-aware angular sectors of equal demand (deterministic)
+    kmeans           distance-based, ignores demand (random unless seeded)
+    agglomerative    distance-based, ignores demand (deterministic)
 
 Empty clusters are dropped, so the result can have fewer than k clusters.
 
@@ -46,31 +44,23 @@ def sweep_clustering(coordinates, demands, n_clusters, seed=None):
     """
     Demand-aware angular sweep around the depot.
 
-    Customers are sorted by polar angle around the depot, measured from a
-    start angle. The start angle is drawn from seed, so different seeds
-    cut the circle at different places. seed=None uses the unshifted
-    order (angles starting just after the negative x-axis).
-
-    The sorted sequence is cut into n_clusters contiguous sectors of about
-    equal demand. Each customer is placed by the midpoint of its demand
-    interval along the sweep, so a customer falls in the sector that
-    contains the middle of its demand.
+    Customers are sorted by polar angle around the depot, measured from the
+    negative x-axis. The sorted sequence is cut into n_clusters contiguous
+    sectors of about equal demand. Each customer is placed by the midpoint
+    of its demand interval along the sweep, so a customer falls in the
+    sector that contains the middle of its demand.
 
     If total demand is zero, the sweep falls back to equal customer counts.
+    The method is deterministic; seed is accepted for interface compatibility.
     """
 
     depot = coordinates[0]
     customers = coordinates[1:]
     customer_demands = np.asarray(demands, dtype=float)[1:]
 
-    if seed is None:
-        shift = 0.0
-    else:
-        shift = np.random.default_rng(seed).uniform(0.0, 2.0 * np.pi)
-
     offsets = customers - depot
     angles = np.mod(
-        np.arctan2(offsets[:, 1], offsets[:, 0]) + np.pi - shift,
+        np.arctan2(offsets[:, 1], offsets[:, 0]) + np.pi,
         2.0 * np.pi,
     )
     order = np.argsort(angles)
@@ -103,8 +93,8 @@ def sweep_clustering(coordinates, demands, n_clusters, seed=None):
     return labels
 
 
-def kmeans_clustering(coordinates, demands, n_clusters, seed=42):
-    """Unweighted k-means. Demand is not used."""
+def kmeans_clustering(coordinates, demands, n_clusters, seed=None):
+    """Unweighted k-means on customer coordinates. Demand is not used."""
 
     model = KMeans(
         n_clusters=n_clusters,
@@ -116,27 +106,11 @@ def kmeans_clustering(coordinates, demands, n_clusters, seed=42):
     return model.fit_predict(coordinates[1:])
 
 
-def kmeans_weighted_clustering(coordinates, demands, n_clusters, seed=42):
-    """
-    Demand-weighted k-means. Each customer pulls its centroid in proportion
-    to its demand, so centroids sit where the load is rather than where the
-    headcount is. Customers with zero demand get weight 1 so they still count.
-    """
-
-    weights = np.maximum(np.asarray(demands, dtype=float)[1:], 1.0)
-
-    model = KMeans(
-        n_clusters=n_clusters,
-        init="k-means++",
-        n_init="auto",
-        random_state=seed,
-    )
-
-    return model.fit_predict(coordinates[1:], sample_weight=weights)
-
-
 def agglomerative_clustering(coordinates, demands, n_clusters, seed=None):
-    """Demand is not used. Deterministic, so seed is unused."""
+    """
+    Agglomerative clustering on customer coordinates. Demand is not used.
+    Deterministic; seed is accepted for interface compatibility.
+    """
 
     model = AgglomerativeClustering(n_clusters=n_clusters)
 
@@ -146,7 +120,6 @@ def agglomerative_clustering(coordinates, demands, n_clusters, seed=None):
 METHODS = {
     "sweep": sweep_clustering,
     "kmeans": kmeans_clustering,
-    "kmeans_weighted": kmeans_weighted_clustering,
     "agglomerative": agglomerative_clustering,
 }
 
@@ -155,18 +128,36 @@ METHODS = {
 # PUBLIC API
 # ============================================================
 
-def cluster_count(num_customers, target_customers):
-    """ceil(num_customers / target_customers), kept between 1 and num_customers."""
-
-    if target_customers < 1:
-        raise ValueError(f"target_customers must be at least 1, got {target_customers}.")
-
-    return max(1, min(num_customers, math.ceil(num_customers / target_customers)))
-
-
-def make_clusters(coordinates, demands, target_customers, method, seed=None):
+def cluster_count(num_customers, min_vehicles, sizing, value):
     """
-    Cluster the customers into cluster_count(...) clusters.
+    Number of clusters k.
+
+        sizing="routes"     k = ceil(min_vehicles / value)
+        sizing="customers"  k = ceil(num_customers / value)
+
+    min_vehicles is the lower bound ceil(total demand / capacity), so the
+    real number of routes in a cluster can be somewhat above value.
+    k is kept between 1 and num_customers.
+    """
+
+    if value < 1:
+        raise ValueError(f"{sizing} size must be at least 1, got {value}.")
+
+    if sizing == "routes":
+        needed = math.ceil(min_vehicles / value)
+
+    elif sizing == "customers":
+        needed = math.ceil(num_customers / value)
+
+    else:
+        raise ValueError(f"sizing must be 'routes' or 'customers', got '{sizing}'.")
+
+    return max(1, min(num_customers, needed))
+
+
+def make_clusters(coordinates, demands, n_clusters, method, seed=None):
+    """
+    Cluster the customers into n_clusters clusters with the given method.
 
     Returns a list of clusters, each a list of 0-based customer indices
     (depot excluded). Empty clusters are dropped.
@@ -180,7 +171,10 @@ def make_clusters(coordinates, demands, target_customers, method, seed=None):
 
     num_customers = len(coordinates) - 1
 
-    n_clusters = cluster_count(num_customers, target_customers)
+    if not 1 <= n_clusters <= num_customers:
+        raise ValueError(
+            f"n_clusters must be between 1 and {num_customers}, got {n_clusters}."
+        )
 
     labels = METHODS[method](coordinates, demands, n_clusters, seed)
 
@@ -232,12 +226,14 @@ def _round(value, digits):
     return None if value is None else round(value, digits)
 
 
-def clustering_quality(coordinates, demands, clusters, target_customers, seed=0):
+def clustering_quality(coordinates, demands, clusters, seed=0):
     """
-    Quality of the clustering, before any routes exist.
+    Summary of the clustering before any routes exist. Returns a dict with:
 
-    Returns (summary, per_cluster): summary is a dict of overall values,
-    per_cluster has one dict per cluster.
+        demand_cv                spread of cluster demands (std / mean)
+        mean_customer_radius     mean distance from a customer to its cluster centroid
+        nearest_centroid_share   share of customers whose own centroid is the nearest one
+        silhouette               sampled silhouette score, or None
     """
 
     points = np.asarray(coordinates, dtype=float)[1:]
@@ -253,28 +249,12 @@ def clustering_quality(coordinates, demands, clusters, target_customers, seed=0)
         for cluster in clusters
     ])
 
-    per_cluster = []
-    all_radii = []
-    cluster_demands = []
+    cluster_demands = [
+        int(customer_demands[np.asarray(cluster)].sum())
+        for cluster in clusters
+    ]
 
-    for label, cluster in enumerate(clusters):
-
-        idx = np.asarray(cluster)
-
-        demand = int(customer_demands[idx].sum())
-        radii = np.linalg.norm(points[idx] - centroids[label], axis=1)
-
-        cluster_demands.append(demand)
-        all_radii.append(radii)
-
-        per_cluster.append({
-            "cluster": label + 1,
-            "customers": len(idx),
-            "customer_ratio": round(len(idx) / target_customers, 3),
-            "demand": demand,
-            "mean_radius": round(float(radii.mean()), 1),
-            "max_radius": round(float(radii.max()), 1),
-        })
+    radii = np.linalg.norm(points - centroids[labels], axis=1)
 
     distances = np.linalg.norm(
         points[:, None, :] - centroids[None, :, :],
@@ -283,18 +263,9 @@ def clustering_quality(coordinates, demands, clusters, target_customers, seed=0)
 
     nearest_share = float(np.mean(np.argmin(distances, axis=1) == labels))
 
-    sizes = [row["customers"] for row in per_cluster]
-
-    summary = {
-        "n_clusters": len(clusters),
-        "customers_min": min(sizes),
-        "customers_max": max(sizes),
-        "demand_min": min(cluster_demands),
-        "demand_max": max(cluster_demands),
+    return {
         "demand_cv": round(_coefficient_of_variation(cluster_demands), 3),
-        "mean_customer_radius": round(float(np.concatenate(all_radii).mean()), 1),
+        "mean_customer_radius": round(float(radii.mean()), 1),
         "nearest_centroid_share": round(nearest_share, 4),
         "silhouette": _round(_silhouette(points, labels, seed), 4),
     }
-
-    return summary, per_cluster

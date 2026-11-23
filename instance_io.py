@@ -67,6 +67,7 @@ def read_vrp(filepath):
 
 
 def calculate_number_of_vehicles(demands, capacity):
+    """Lower bound on the number of vehicles: ceil(total demand / capacity)."""
 
     return int(np.ceil(demands.sum() / capacity))
 
@@ -125,7 +126,7 @@ def write_routes_txt(
 ):
     """
     Write routes as text: one line per route with load, distance and,
-    if given, its cluster. Returns the per-route statistics.
+    if route_clusters is given, the cluster the route belongs to.
     """
 
     stats = route_stats(coordinates, demands, routes)
@@ -157,8 +158,6 @@ def write_routes_txt(
                 f"distance {stat['distance']}: "
                 f"CD0 {customers} CD0\n"
             )
-
-    return stats
 
 
 # ============================================================
@@ -220,11 +219,13 @@ def _cluster_hull(points):
 
 
 def _points(coordinates, indices):
+    """Coordinates of customers given as 0-based indices (depot excluded)."""
 
     return np.array([coordinates[i + 1] for i in indices])
 
 
 def _members_by_group(routes, route_groups, n_groups):
+    """Customer indices collected per group (cluster), in route order."""
 
     members = {group: [] for group in range(n_groups)}
 

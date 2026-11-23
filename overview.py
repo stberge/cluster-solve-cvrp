@@ -1,18 +1,15 @@
 """
-Excel overview of all runs.
+Excel overview built from the per-run JSON files.
 
-One sheet ("runs"), one row per run, identified by run_id. Rows are
-appended and never merged, so repeating a configuration adds another row.
+The JSON files are the source of truth. The overview is rebuilt from them,
+so a locked Excel file cannot lose results.
 
-The overview holds settings, clustering measures and the distance result.
-Route details (route count, route overhead) are only in each run's
-_routes.txt and _clusters.csv files.
-
-Overviews written by earlier versions are converted when read. Their
-num_routes and route_overhead columns are dropped when the file is rewritten.
+Sheets:
+    runs     every run with status "ok"
+    failed   every run that raised an error, with the message and traceback
 """
 
-from datetime import datetime
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -21,155 +18,119 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 
-SHEET_NAME = "runs"
+# Kept in the JSON files, left out of the spreadsheet
+DROP_FROM_OVERVIEW = {"routes", "route_clusters", "limits"}
 
-INTEGER_COLUMNS = [
-    "target_routes_per_cluster",
-    "target_customers_per_cluster",
-    "n_clusters_requested",
-    "n_clusters_formed",
-    "min_cluster_customers",
-    "max_cluster_customers",
-    "min_cluster_demand",
-    "max_cluster_demand",
-    "total_distance",
-    "total_time_s",
-    "seed",
+# Shown first, in this order. Other fields follow alphabetically.
+# Kept in the JSON files, left out of the spreadsheet
+DROP_FROM_OVERVIEW = {"routes", "route_clusters", "limits"}
+
+# Shown first, in this order. Other fields follow alphabetically.
+PRIORITY_COLUMNS = [
+    "instance", "kind", "clustering", "sizing", "sizing_value", "run", "seed",
+    "status", "distance", "n_routes", "routes_per_customer", "route_overhead",
+    "n_customers", "capacity", "min_vehicles", "total_demand",
+    "clusters_requested", "clusters_formed", "n_calls",
+    "search_s", "clustering_s", "wall_s",
+    "cost_ok", "silhouette", "nearest_centroid_share", "demand_cv",
+    "mean_customer_radius", "max_cluster_load_pct",
+    "customers_min", "customers_max", "cluster_demand_min", "cluster_demand_max",
+    "time_share_basis", "total_budget_s", "peak_mb_process_so_far",
+    "error", "run_key", "started_at", "finished_at", "machine",
 ]
 
-COLUMNS = [
-    "run_id",
-    "last_run",
-    "instance",
-    "method",
-    "algorithm",
-    "target_routes_per_cluster",     # older runs only
-    "target_customers_per_cluster",  # target m
-    "time_share_basis",
-    "n_clusters_requested",
-    "n_clusters_formed",
-    "min_cluster_customers",
-    "max_cluster_customers",
-    "min_cluster_demand",
-    "max_cluster_demand",
-    "max_cluster_load_pct",
-    "demand_cv",
-    "nearest_centroid_share",
-    "silhouette",
-    "mean_customer_radius",
-    "total_distance",
-    "avg_time_per_cluster_s",
-    "total_time_s",
-    "seed",
-    "output_folder",
-    "file_name",
-]
-
-# Column names used by earlier versions. Applied in two steps, so the
-# old time column ends up under its current name.
-LEGACY_COLUMNS_STEP_1 = {
-    "hgs_time_per_cluster_s": "time_per_cluster_s",
-    "total_hgs_time_s": "total_time_s",
-}
-
-LEGACY_COLUMNS_STEP_2 = {
-    "time_per_cluster_s": "avg_time_per_cluster_s",
-}
-
-LEGACY_METHODS = {
-    "clustered_hgs": "clustered",
-    "regular_hgs": "whole_instance",
-}
-
-COLUMN_WIDTHS = {
-    "output_folder": 70,
-    "file_name": 55,
-    "last_run": 20,
-    "run_id": 20,
-}
+SORT_KEYS = ["instance", "kind", "clustering", "sizing", "sizing_value", "run"]
 
 
-def update_overview(path, rows):
-    """
-    Append rows (dicts keyed by COLUMNS; missing keys are left blank)
-    to the Excel overview at path. Every row is kept.
-    """
+def _cell(value):
+    """Lists and dicts become JSON text so Excel can hold them."""
 
-    path = Path(path)
+    if isinstance(value, (dict, list)):
+        return json.dumps(value)
 
-    new_rows = pd.DataFrame(rows)
-
-    new_rows["last_run"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    new_rows = new_rows.reindex(columns=COLUMNS)
-
-    if path.exists():
-        combined = pd.concat([_load_existing(path), new_rows], ignore_index=True)
-    else:
-        combined = new_rows
-
-    combined = _tidy(combined).reindex(columns=COLUMNS)
-
-    try:
-        with pd.ExcelWriter(path, engine="openpyxl") as writer:
-            combined.to_excel(writer, sheet_name=SHEET_NAME, index=False)
-
-    except PermissionError as error:
-        raise PermissionError(
-            f"Could not write {path}. Close it in Excel and run again."
-        ) from error
-
-    _format_sheet(path)
-
-    return path
+    return value
 
 
-def _load_existing(path):
-    """Read the current overview, converting legacy column and method names."""
+def _read_rows(result_root):
 
-    old_rows = pd.read_excel(path, sheet_name=SHEET_NAME)
+    ok_rows = []
+    failed_rows = []
 
-    old_rows = old_rows.rename(columns=LEGACY_COLUMNS_STEP_1)
-    old_rows = old_rows.rename(columns=LEGACY_COLUMNS_STEP_2)
+    for path in sorted(Path(result_root).rglob("*.json")):
 
-    if "method" in old_rows.columns:
-        old_rows["method"] = old_rows["method"].replace(LEGACY_METHODS)
+        record = json.loads(path.read_text(encoding="utf-8"))
 
-    return old_rows
+        row = {k: _cell(v) for k, v in record.items() if k not in DROP_FROM_OVERVIEW}
 
+        if record.get("status") == "ok":
+            ok_rows.append(row)
+        else:
+            failed_rows.append(row)
 
-def _tidy(df):
-    """Integer columns become integers (no '.0'). Missing values stay blank."""
-
-    for column in INTEGER_COLUMNS:
-
-        if column in df.columns:
-            df[column] = pd.to_numeric(df[column], errors="coerce").astype("Int64")
-
-    return df
+    return ok_rows, failed_rows
 
 
-def _format_sheet(path):
-    """Header style, column widths, frozen header row and filter."""
+def _ordered(df):
+
+    first = [c for c in PRIORITY_COLUMNS if c in df.columns]
+    rest = sorted(c for c in df.columns if c not in first)
+
+    return df[first + rest]
+
+
+def _sorted(df):
+
+    keys = [k for k in SORT_KEYS if k in df.columns]
+
+    return df.sort_values(keys, na_position="first").reset_index(drop=True) if keys else df
+
+
+def build_overview(result_root, xlsx_path):
+    """Rebuild the Excel overview from every run JSON under result_root."""
+
+    xlsx_path = Path(xlsx_path)
+
+    ok_rows, failed_rows = _read_rows(result_root)
+
+    print(f"Overview: {len(ok_rows)} ok, {len(failed_rows)} failed -> {xlsx_path}")
+
+    if not ok_rows and not failed_rows:
+        print("No run files found.")
+        return
+
+    with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+
+        if ok_rows:
+            runs = _sorted(_ordered(pd.DataFrame(ok_rows))).round(4)
+            runs.to_excel(writer, sheet_name="runs", index=False)
+
+        if failed_rows:
+            failed = _ordered(pd.DataFrame(failed_rows))
+            failed.to_excel(writer, sheet_name="failed", index=False)
+
+    _format(xlsx_path)
+
+
+def _format(path):
+    """Header style, column widths, frozen header row and filter on every sheet."""
 
     workbook = load_workbook(path)
-    sheet = workbook[SHEET_NAME]
 
     header_fill = PatternFill("solid", start_color="1F4E78")
 
-    for cell in sheet[1]:
+    for sheet in workbook.worksheets:
 
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        for cell in sheet[1]:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-    for index, column in enumerate(COLUMNS, start=1):
+        for index, cell in enumerate(sheet[1], start=1):
+            name = str(cell.value or "")
+            width = min(max(len(name) + 2, 12), 40)
+            sheet.column_dimensions[get_column_letter(index)].width = width
 
-        width = COLUMN_WIDTHS.get(column, max(len(column) + 2, 12))
-
-        sheet.column_dimensions[get_column_letter(index)].width = width
-
-    sheet.freeze_panes = "A2"
-    sheet.auto_filter.ref = sheet.dimensions
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = sheet.dimensions
 
     workbook.save(path)

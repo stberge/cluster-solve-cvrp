@@ -1,30 +1,70 @@
 """
-Route solving with AILS-II, through the ailsii Python package.
+AILS-II routing through the ailsii package.
 
-Same interface as the PyVRP version (ILS.py):
+    solve_cluster(...)        every cluster solved on its own
+    solve_whole_instance(...) the full instance solved in one call
 
-    solve_cluster            every cluster, each with its own time limit
-    solve_whole_instance     the full instance in one run
+Each AILS-II call gets a whole-second timeLimit taken from the run's time
+share. The budget is never changed by the measurements. Each call's
+elapsed time is measured, and the overhead (elapsed minus timeLimit) is
+recorded so it can be corrected for later.
 
-Distances and loads are recomputed in Python with route_stats, so the
-totals match the route files whatever the solver reports.
+Distances are recomputed with route_stats, so reported totals match the
+route files. The solver's own cost is kept and compared as a check.
 """
 
 import time
 
 import numpy as np
-
 import ailsii
 
-from instance_io import read_vrp, route_stats
+from instance_io import route_stats
 
 
 # ============================================================
 # SETTINGS
 # ============================================================
 
-# AILS-II parameters (defaults from the README)
+# AILS-II parameters (README defaults). Stored with every run.
 AILS_PARAMS = dict(varphi=40, gamma=30, dMax=30, dMin=15)
+
+# Smallest timeLimit (s) allowed for one cluster.
+MIN_LIMIT = 5
+
+# Guard: clusters above this size are rejected. Placeholder value, set it to
+# the size you have validated.
+MAX_CLUSTER_CUSTOMERS = 3000
+
+PRINT_SOLVER_CALLS = True
+
+
+# ============================================================
+# TIME LIMITS
+# ============================================================
+
+def integer_limits(shares):
+    """
+    Whole-second timeLimit per share. The limits sum to the floor of the
+    total share, so the requested search time never exceeds the budget.
+    """
+
+    shares = np.asarray(shares, dtype=float)
+
+    if np.any(shares < MIN_LIMIT):
+        worst = int(np.argmin(shares))
+        raise ValueError(
+            f"Share {worst} is {shares[worst]:.2f} s, below the minimum of "
+            f"{MIN_LIMIT} s. Use fewer clusters or a larger TOTAL_TIME."
+        )
+
+    limits = np.floor(shares).astype(int)
+
+    spare = int(np.floor(shares.sum() + 1e-9)) - int(limits.sum())
+
+    order = np.argsort(-(shares - limits), kind="stable")
+    limits[order[:spare]] += 1
+
+    return limits.tolist()
 
 
 # ============================================================
@@ -33,8 +73,11 @@ AILS_PARAMS = dict(varphi=40, gamma=30, dMax=30, dMin=15)
 
 def _solve(points, demands, capacity, time_limit):
     """
-    Run AILS-II on one CVRP. points and demands include the depot at index 0.
-    Returns (routes as 0-based customer indices, solver cost).
+    One AILS-II call. points and demands include the depot at index 0.
+
+    Returns routes (0-based customer indices), the solver's cost, the
+    timeLimit that was set, the measured elapsed time of the call, and
+    the overhead (elapsed minus timeLimit).
     """
 
     if demands[0] != 0:
@@ -47,6 +90,8 @@ def _solve(points, demands, capacity, time_limit):
         "vehicle_capacity": int(capacity),
     }
 
+    started = time.perf_counter()
+
     params = ailsii.AlgorithmParameters(
         timeLimit=float(time_limit),
         stoppingCriterion="Time",
@@ -56,13 +101,20 @@ def _solve(points, demands, capacity, time_limit):
 
     result = ailsii.Solver(parameters=params, verbose=False).solve_cvrp(data)
 
+    elapsed = time.perf_counter() - started
+
     # The solver numbers the depot 0 and customers 1..n,
     # so customer k (0-based) is index k + 1.
     routes = [[node - 1 for node in route] for route in result.routes]
-
     routes = [route for route in routes if route]
 
-    return routes, result.cost
+    return {
+        "routes": routes,
+        "solver_cost": float(result.cost),
+        "limit": int(time_limit),
+        "elapsed": round(elapsed, 3),
+        "overhead": round(elapsed - time_limit, 3),
+    }
 
 
 def _check_solution(routes, demands, capacity):
@@ -86,14 +138,46 @@ def _check_solution(routes, demands, capacity):
             raise RuntimeError(f"Route load {load} exceeds capacity {capacity}.")
 
 
-def _warn_if_different(solver_cost, distance):
-    """The solver's cost and the recomputed distance should match."""
+def _cost_ok(solver_cost, distance):
+    """True if the solver's cost matches the recomputed distance."""
 
-    if abs(solver_cost - distance) > 0.5:
+    ok = abs(solver_cost - distance) <= 0.5
+
+    if not ok:
         print(
             f"WARNING: solver cost {solver_cost} differs from "
             f"recomputed distance {distance}"
         )
+
+    return ok
+
+
+def _print_call(call):
+
+    if PRINT_SOLVER_CALLS:
+        print(
+            f"          solver call: timeLimit {call['limit']} s, "
+            f"elapsed {call['elapsed']:.2f} s, overhead {call['overhead']:.2f} s"
+        )
+
+
+def _summary(routes, route_clusters, distance, limits, calls):
+    """Common result format for both solve functions."""
+
+    overheads = [call["overhead"] for call in calls]
+
+    return {
+        "routes": routes,
+        "route_clusters": route_clusters,
+        "distance": int(distance),
+        "limits": limits,
+        "n_calls": len(calls),
+        "search_s": int(sum(limits)),
+        "solver_elapsed_s": round(sum(call["elapsed"] for call in calls), 3),
+        "setup_s": round(sum(overheads), 3),
+        "setup_max_s": round(max(overheads), 3),
+        "cost_ok": all(call["cost_ok"] for call in calls),
+    }
 
 
 # ============================================================
@@ -106,108 +190,104 @@ def _solve_one_cluster(
     customer_demands,
     original_indices,
     capacity,
-    time_limit,
+    limit,
 ):
     """
     Solve one cluster as a multi-vehicle CVRP.
 
-    Returns (routes, distance). Routes are lists of ORIGINAL 0-based
-    customer indices in visit order.
+    Returns (routes, distance, call). Routes use ORIGINAL 0-based customer
+    indices.
     """
-
-    if len(customer_coords) == 0:
-        return [], 0
 
     points = np.vstack([depot_coord, customer_coords]).astype(float)
 
     demands = np.concatenate([[0], np.asarray(customer_demands, dtype=int)])
 
-    local_routes, solver_cost = _solve(points, demands, capacity, time_limit)
+    call = _solve(points, demands, capacity, limit)
 
-    _check_solution(local_routes, demands, capacity)
+    _print_call(call)
 
-    distance = sum(s["distance"] for s in route_stats(points, demands, local_routes))
+    _check_solution(call["routes"], demands, capacity)
 
-    _warn_if_different(solver_cost, distance)
+    distance = sum(s["distance"] for s in route_stats(points, demands, call["routes"]))
 
-    routes = [[original_indices[i] for i in route] for route in local_routes]
+    call["cost_ok"] = _cost_ok(call["solver_cost"], distance)
 
-    return routes, distance
+    routes = [[original_indices[i] for i in route] for route in call["routes"]]
+
+    return routes, distance, call
 
 
 # ============================================================
 # SOLVE ALL CLUSTERS
 # ============================================================
 
-def solve_cluster(coordinates, demands, clusters, capacity, time_limits, seed=None):
+def solve_cluster(coordinates, demands, clusters, capacity, time_limits):
     """
     Solve every cluster as its own subproblem.
 
-    time_limits holds one runtime (seconds) per cluster, in the same
-    order as clusters. seed is accepted for interface compatibility;
-    AILS-II has no seed option.
-
-    Returns (routes, route_clusters, total_distance).
+    time_limits holds one search share (seconds) per cluster, in the same
+    order as clusters. integer_limits converts them to whole seconds.
     """
 
     if len(time_limits) != len(clusters):
-        raise ValueError("Need exactly one time limit per cluster.")
+        raise ValueError("Need exactly one time share per cluster.")
+
+    largest = max(len(cluster) for cluster in clusters)
+
+    if largest > MAX_CLUSTER_CUSTOMERS:
+        raise ValueError(
+            f"A cluster has {largest} customers, above MAX_CLUSTER_CUSTOMERS "
+            f"({MAX_CLUSTER_CUSTOMERS})."
+        )
+
+    limits = integer_limits(time_limits)
 
     depot = coordinates[0]
 
     routes = []
     route_clusters = []
-    total_distance = 0
+    calls = []
+    distance = 0
 
-    for cluster_id, (cluster, time_limit) in enumerate(zip(clusters, time_limits)):
+    for cluster_id, (cluster, limit) in enumerate(zip(clusters, limits)):
 
         idx = np.asarray(cluster) + 1
 
-        cluster_routes, distance = _solve_one_cluster(
+        cluster_routes, cluster_distance, call = _solve_one_cluster(
             depot,
             coordinates[idx],
             demands[idx],
             cluster,
             capacity,
-            time_limit,
+            limit,
         )
 
         routes.extend(cluster_routes)
         route_clusters.extend([cluster_id] * len(cluster_routes))
-        total_distance += distance
+        distance += cluster_distance
+        calls.append(call)
 
-    return routes, route_clusters, total_distance
+    return _summary(routes, route_clusters, distance, limits, calls)
 
 
 # ============================================================
 # WHOLE INSTANCE
 # ============================================================
 
-def solve_whole_instance(instance_path, time_limit, seed=None):
-    """
-    Solve the full CVRP in one run. time_limit is the total runtime (seconds).
+def solve_whole_instance(coordinates, demands, capacity, time_limit):
+    """Solve the full CVRP in one call with the whole budget as its timeLimit."""
 
-    Returns a dict with routes (0-based customer indices), distance,
-    runtime (seconds) and feasible.
-    """
+    limit = integer_limits([time_limit])[0]
 
-    coordinates, demands, capacity = read_vrp(instance_path)
+    call = _solve(coordinates, demands, capacity, limit)
 
-    started = time.perf_counter()
+    _print_call(call)
 
-    routes, solver_cost = _solve(coordinates, demands, capacity, time_limit)
+    _check_solution(call["routes"], demands, capacity)
 
-    runtime = time.perf_counter() - started
+    distance = sum(s["distance"] for s in route_stats(coordinates, demands, call["routes"]))
 
-    _check_solution(routes, demands, capacity)
+    call["cost_ok"] = _cost_ok(call["solver_cost"], distance)
 
-    distance = sum(s["distance"] for s in route_stats(coordinates, demands, routes))
-
-    _warn_if_different(solver_cost, distance)
-
-    return {
-        "routes": routes,
-        "distance": distance,
-        "runtime": runtime,
-        "feasible": True,
-    }
+    return _summary(call["routes"], None, distance, [limit], [call])
