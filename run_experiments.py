@@ -1,5 +1,5 @@
 """
-Benchmark runner: clustered runs and the whole-instance baseline on the XL set.
+Benchmark runner: clustered runs and the whole-instance baseline.
 
 Change the SETTINGS block, then run:
     python run_benchmark.py              run the batch (resumes automatically)
@@ -8,8 +8,12 @@ Change the SETTINGS block, then run:
 Clusters
 --------
 Clustered runs are sized by routes per cluster R: k = ceil(min_vehicles / R),
-where min_vehicles = ceil(total demand / capacity). Real routes per cluster
-can be somewhat above R, because min_vehicles is a lower bound.
+or by customers per cluster m: k = ceil(customers / m). min_vehicles is
+ceil(total demand / capacity), a lower bound, so real routes per cluster can
+be somewhat above R.
+
+A clustered run with k = 1 is skipped, because the whole-instance run covers
+that case. It is still recorded (status "skipped") so it shows in the overview.
 
 Seeds
 -----
@@ -19,23 +23,25 @@ run's JSON. Other methods have no seed.
 Time
 ----
 Every run gets TOTAL_TIME seconds of AILS-II search, split across its clusters
-by TIME_SHARE_BASIS. Each AILS-II call's timeLimit is its share. No setup or
-overhead time is subtracted or reported.
+by TIME_SHARE_BASIS. Each AILS-II call's timeLimit is its share. The measured
+solver overhead is recorded, not subtracted.
 
 Output
 ------
-    RESULT_ROOT/budget_{TOTAL_TIME}s/{instance}/{run_key}.json   source of truth
+    RESULT_ROOT/budget_{TOTAL_TIME}s/{instance}/{run_key}.json
     RESULT_ROOT/budget_{TOTAL_TIME}s/{instance}/{run_key}_routes.txt
     RESULT_ROOT/budget_{TOTAL_TIME}s/{instance}/{run_key}.sol
-    RESULT_ROOT/overview_{TOTAL_TIME}s.xlsx                      built from the JSON files
+    RESULT_ROOT/budget_{TOTAL_TIME}s/{instance}/{run_key}_routes.png   (if SAVE_PLOTS)
+    RESULT_ROOT/budget_{TOTAL_TIME}s/{instance}/{run_key}_trace.txt
+    RESULT_ROOT/overview_{TOTAL_TIME}s.xlsx    rebuilt after every run
 
-Run keys look like:
+The JSON file is the source of truth. Run keys look like:
     <instance>__whole__r1
     <instance>__kmeans__R30__r2
 
 A failed run is recorded with status "failed" and the batch continues.
-Failed runs are retried when the batch is started again. Finished runs
-are skipped.
+Failed runs are retried when the batch is started again. Finished (ok) and
+skipped runs are not repeated.
 """
 
 import os
@@ -56,7 +62,7 @@ import numpy as np
 import psutil
 import sklearn
 
-from ails_solver import AILS_PARAMS, MAX_CLUSTER_CUSTOMERS, solve_cluster, solve_whole_instance
+from ails_solver import AILS_PARAMS, solve_cluster, solve_whole_instance
 from clustering import METHODS, cluster_count, clustering_quality, make_clusters
 from instance_io import (
     calculate_number_of_vehicles,
@@ -64,6 +70,7 @@ from instance_io import (
     read_vrp,
     write_routes_txt,
     write_sol,
+    write_trace_txt,
 )
 from overview import build_overview
 
@@ -76,8 +83,9 @@ INSTANCE_DIR = Path(
     r"C:\Users\20235296\Documents\4de Jaar IE\BEP\data\instances\XL"
 )
 
-# Local disk recommended: OneDrive-synced folders can lock files mid-batch.
-RESULT_ROOT = Path(r"C:\Users\20235296\Documents\4de Jaar IE\BEP\results")
+RESULT_ROOT = Path(
+    r"C:\Users\20235296\Documents\4de Jaar IE\BEP\results1"
+)
 
 # Search budget per run (s), identical for every method.
 TOTAL_TIME = 600
@@ -86,14 +94,14 @@ TOTAL_TIME = 600
 # 0 skips a method. sweep and agglomerative always give the same clusters,
 # but AILS-II is a stochastic search, so repeated runs still differ.
 RUNS = {
-    "sweep": 1,
-    "agglomerative": 1,
-    "kmeans": 1,
-    "whole": 1,
+    "sweep": 3,
+    "agglomerative": 3,
+    "kmeans": 3,
+    "whole": 3,
 }
 
 # Cluster sizes: k = ceil(min_vehicles / R) for each R.
-ROUTES_PER_CLUSTER = [30, 50, 80, 130, 200, 300]
+ROUTES_PER_CLUSTER = [200]
 
 # Optional: k = ceil(num_customers / m) for each m. Leave empty to skip.
 TARGET_CUSTOMERS_PER_CLUSTER = []
@@ -113,6 +121,8 @@ SIZINGS = (
 )
 
 SIZE_LETTER = {"routes": "R", "customers": "m"}
+
+DONE_STATUSES = ("ok", "skipped")
 
 
 # ============================================================
@@ -184,6 +194,12 @@ def check_settings():
 
     if any(n < 0 for n in RUNS.values()):
         raise ValueError("Run counts in RUNS must be 0 or more.")
+
+    if TOTAL_TIME < 1:
+        raise ValueError("TOTAL_TIME must be at least 1 second.")
+
+    if any(r < 1 for r in ROUTES_PER_CLUSTER) or any(m < 1 for m in TARGET_CUSTOMERS_PER_CLUSTER):
+        raise ValueError("Cluster sizes in ROUTES_PER_CLUSTER and TARGET_CUSTOMERS_PER_CLUSTER must be at least 1.")
 
     if CLUSTER_METHODS and not SIZINGS:
         raise ValueError(
@@ -306,23 +322,51 @@ def count_route_overhead(route_clusters, n_clusters, cluster_demands, capacity):
 
 
 # ============================================================
+# INSTANCE DATA
+# ============================================================
+
+def load_instance(path):
+    """Read one instance and check that every customer fits in one vehicle."""
+
+    coordinates, demands, capacity = read_vrp(path)
+
+    if demands[1:].max() > capacity:
+        raise ValueError(f"a customer demand exceeds the capacity {capacity}")
+
+    min_vehicles = calculate_number_of_vehicles(demands[1:], capacity)
+
+    return coordinates, demands, capacity, min_vehicles
+
+
+def instance_fields(data):
+    """Instance-level fields stored in every record."""
+
+    coordinates, demands, capacity, min_vehicles = data
+
+    return {
+        "n_customers": len(coordinates) - 1,
+        "capacity": capacity,
+        "total_demand": int(demands[1:].sum()),
+        "min_vehicles": min_vehicles,
+    }
+
+
+# ============================================================
 # ONE RUN
 # ============================================================
 
-def execute(spec, coordinates, demands, capacity, min_vehicles):
+def execute(spec, data, n_clusters):
     """Run one configuration and return its result dict."""
+
+    coordinates, demands, capacity, _ = data
 
     if spec["kind"] == "whole":
         return solve_whole_instance(coordinates, demands, capacity, TOTAL_TIME)
 
-    method = spec["clustering"]
-    seed = spec["seed"]
-    n_customers = len(coordinates) - 1
-
-    n_clusters = cluster_count(n_customers, min_vehicles, spec["sizing"], spec["value"])
-
     started = time.perf_counter()
-    clusters = make_clusters(coordinates, demands, n_clusters, method, seed)
+
+    clusters = make_clusters(coordinates, demands, n_clusters, spec["clustering"], spec["seed"])
+
     clustering_s = time.perf_counter() - started
 
     sizes = [len(cluster) for cluster in clusters]
@@ -332,11 +376,13 @@ def execute(spec, coordinates, demands, capacity, min_vehicles):
         for cluster in clusters
     ]
 
-    time_limits = cluster_time_limits(clusters, demands)
-
-    quality = clustering_quality(coordinates, demands, clusters, 0 if seed is None else seed)
-
-    result = solve_cluster(coordinates, demands, clusters, capacity, time_limits)
+    result = solve_cluster(
+        coordinates,
+        demands,
+        clusters,
+        capacity,
+        cluster_time_limits(clusters, demands),
+    )
 
     result.update({
         "clusters_requested": n_clusters,
@@ -350,18 +396,20 @@ def execute(spec, coordinates, demands, capacity, min_vehicles):
         "cluster_demand_min": min(cluster_demands),
         "cluster_demand_max": max(cluster_demands),
         "max_cluster_load_pct": round(100 * max(cluster_demands) / capacity, 1),
-        **quality,
+        **clustering_quality(coordinates, demands, clusters, spec["seed"]),
     })
 
     return result
 
 
-def save_outputs(folder, key, instance, spec, coordinates, demands, capacity, result):
-    """Routes text, .sol file and optional plot for one successful run."""
+def save_outputs(folder, key, instance, spec, data, result):
+    """Routes text, .sol, trace and (optionally) plot for one successful run."""
+
+    coordinates, demands, capacity, _ = data
 
     routes = result["routes"]
     distance = result["distance"]
-    route_clusters = result["route_clusters"]
+    clustered = spec["kind"] == "clustered"
 
     header = [
         f"Run key: {key}",
@@ -370,19 +418,19 @@ def save_outputs(folder, key, instance, spec, coordinates, demands, capacity, re
         f"Budget (s): {TOTAL_TIME}",
         f"Search time (s): {result['search_s']}",
         f"Solver time measured (s): {result['solver_elapsed_s']}",
-        f"Overhead measured (s): {result['setup_s']}",
+        f"Overhead measured (s): {result['overhead_s']}",
     ]
 
     if SAVE_PLOTS:
         plot_routes(
             coordinates,
             routes,
-            route_clusters if route_clusters is not None else [0] * len(routes),
-            result.get("clusters_formed") or 1,
+            result["route_clusters"] if clustered else [0] * len(routes),
+            result["clusters_formed"] if clustered else 1,
             f"{instance} - {key}\n{len(routes)} routes | distance {distance}",
             folder / f"{key}_routes.png",
             show=SHOW_PLOTS,
-            clustered=route_clusters is not None,
+            clustered=clustered,
         )
 
     write_routes_txt(
@@ -392,9 +440,11 @@ def save_outputs(folder, key, instance, spec, coordinates, demands, capacity, re
         capacity,
         routes,
         distance,
-        route_clusters=route_clusters,
+        route_clusters=result["route_clusters"],
         header_lines=header,
     )
+
+    write_trace_txt(folder / f"{key}_trace.txt", result["trace"], header_lines=header)
 
     write_sol(folder / f"{key}.sol", routes, distance)
 
@@ -409,6 +459,18 @@ def write_json_atomic(path, record):
     os.replace(tmp, path)
 
 
+def refresh_overview():
+    """Rebuild the overview. If Excel has the file open, skip and say so."""
+
+    try:
+        build_overview(budget_folder(), overview_path())
+    except PermissionError:
+        print(
+            f"{INDENT}Overview not updated: {overview_path().name} is open in Excel. "
+            f"Close it; the next run rebuilds it, or run: python run_benchmark.py --overview"
+        )
+
+
 def already_done(json_path):
 
     if not json_path.exists():
@@ -419,7 +481,7 @@ def already_done(json_path):
     except (json.JSONDecodeError, OSError):
         return False
 
-    return record.get("status") == "ok"
+    return record.get("status") in DONE_STATUSES
 
 
 def base_fields(instance, spec, key, started_at):
@@ -433,6 +495,7 @@ def base_fields(instance, spec, key, started_at):
         "sizing_value": spec["value"],
         "run": spec["run"],
         "seed": spec["seed"],
+        "time_share_basis": TIME_SHARE_BASIS if spec["kind"] == "clustered" else None,
         "total_budget_s": TOTAL_TIME,
         "started_at": started_at,
         "finished_at": datetime.now().isoformat(timespec="seconds"),
@@ -441,48 +504,61 @@ def base_fields(instance, spec, key, started_at):
 
 
 def run_one(instance, data, spec, key, folder, progress):
+    """Run one configuration, save its record, refresh the overview, report."""
 
-    coordinates, demands, capacity, min_vehicles = data
-    n_customers = len(coordinates) - 1
+    n_customers = len(data[0]) - 1
     json_path = folder / f"{key}.json"
-
-    if spec["clustering"] == "kmeans":
-        spec = {**spec, "seed": random_seed()}
-
     started_at = datetime.now().isoformat(timespec="seconds")
+
+    n_clusters = None
+
+    if spec["kind"] == "clustered":
+
+        n_clusters = cluster_count(n_customers, data[3], spec["sizing"], spec["value"])
+
+        if n_clusters == 1:
+
+            record = {
+                "status": "skipped",
+                **base_fields(instance, spec, key, started_at),
+                **instance_fields(data),
+                "clusters_requested": 1,
+                "reason": "k = 1: the whole-instance run covers this case",
+            }
+
+            write_json_atomic(json_path, record)
+            refresh_overview()
+
+            stamp(f"{progress} SKIP   {describe(spec)} (k = 1)")
+            return
+
+        if spec["clustering"] == "kmeans":
+            spec = {**spec, "seed": random_seed()}
 
     stamp(f"{progress} START  {describe(spec)}")
 
     t0 = time.perf_counter()
 
     try:
-        result = execute(spec, coordinates, demands, capacity, min_vehicles)
 
-        save_outputs(folder, key, instance, spec, coordinates, demands, capacity, result)
+        result = execute(spec, data, n_clusters)
 
-        wall = time.perf_counter() - t0
+        save_outputs(folder, key, instance, spec, data, result)
 
         routes = result["routes"]
 
         record = {
             "status": "ok",
             **base_fields(instance, spec, key, started_at),
-            "time_share_basis": TIME_SHARE_BASIS if spec["kind"] == "clustered" else None,
-            "n_customers": n_customers,
-            "capacity": capacity,
-            "total_demand": int(demands[1:].sum()),
-            "min_vehicles": min_vehicles,
+            **instance_fields(data),
             "n_routes": len(routes),
             "routes_per_customer": round(len(routes) / n_customers, 5),
-            "wall_s": round(wall, 3),
+            "wall_s": round(time.perf_counter() - t0, 3),
             "peak_mb_process_so_far": peak_mb(),
             "ailsii_params": AILS_PARAMS,
             "versions": VERSIONS,
-            **{k: v for k, v in result.items() if k != "routes"},
-            "routes": routes,
+            **result,
         }
-
-        write_json_atomic(json_path, record)
 
     except Exception as error:
 
@@ -493,28 +569,40 @@ def run_one(instance, data, spec, key, folder, progress):
             "traceback": traceback.format_exc()[-2000:],
         }
 
-        write_json_atomic(json_path, record)
+    # Saved outside the try block: a problem in the overview must not turn
+    # a finished run into a failed one.
+    write_json_atomic(json_path, record)
+    refresh_overview()
 
-        stamp(f"{progress} FAILED {describe(spec)}: {type(error).__name__}: {error}")
+    if record["status"] == "failed":
+        stamp(f"{progress} FAILED {describe(spec)}: {record['error']}")
         return
 
     stamp(f"{progress} DONE   {describe(spec)} | {record['wall_s']:.1f} s wall")
+
+    show_result(record, key)
+
+
+def show_result(record, key):
 
     lines = [
         kv("routes", record["n_routes"]),
         kv("distance", record["distance"]),
         kv("search", f"{record['search_s']} s over {record['n_calls']} call(s)"),
         kv("solver time", f"{record['solver_elapsed_s']:.2f} s measured"),
-        kv("overhead", f"{record['setup_s']:.2f} s measured"),
+        kv("overhead", f"{record['overhead_s']:.2f} s measured"),
     ]
 
-    if spec["kind"] == "clustered":
+    if record["kind"] == "clustered":
         lines.append(
             kv("clusters", f"{record['clusters_formed']} formed / "
                            f"{record['clusters_requested']} requested")
         )
 
+    trace_note = "" if record["trace_complete"] else " (final points only: solver gives no history)"
+
     lines += [
+        kv("trace", f"{len(record['trace'])} points{trace_note}"),
         kv("cost check", "ok" if record["cost_ok"] else "MISMATCH"),
         kv("saved as", key),
     ]
@@ -526,13 +614,10 @@ def run_one(instance, data, spec, key, folder, progress):
 # ONE INSTANCE
 # ============================================================
 
-def run_instance(path, index, count):
+def run_instance(instance, data, index, count):
 
-    instance = path.stem
-
-    coordinates, demands, capacity = read_vrp(path)
-    min_vehicles = calculate_number_of_vehicles(demands[1:], capacity)
-    data = (coordinates, demands, capacity, min_vehicles)
+    coordinates, demands, _, min_vehicles = data
+    capacity = data[2]
 
     folder = budget_folder() / instance
     folder.mkdir(parents=True, exist_ok=True)
@@ -581,20 +666,17 @@ def print_settings(n_instances):
         kv("runs", ", ".join(f"{m} x{n}" for m, n in RUNS.items() if n > 0)),
         kv("cluster sizes", ", ".join(size_labels()) or "none"),
         kv("runs/instance", len(planned_runs())),
-        kv("max cluster", f"{MAX_CLUSTER_CUSTOMERS} customers"),
+        kv("plots", "saved and embedded in overview" if SAVE_PLOTS else "off"),
         kv("ailsii params", str(AILS_PARAMS)),
         kv("output", str(budget_folder())),
     ])
     print(RULE)
 
 
-RULE_LINE = RULE
-
-
 def main():
 
     if "--overview" in sys.argv:
-        build_overview(budget_folder(), overview_path())
+        refresh_overview()
         return
 
     check_settings()
@@ -606,7 +688,7 @@ def main():
     files = sorted(INSTANCE_DIR.glob("*.vrp"))
 
     if not files:
-        print("No .vrp files found.")
+        print(f"No .vrp files found in {INSTANCE_DIR}")
         return
 
     RESULT_ROOT.mkdir(parents=True, exist_ok=True)
@@ -614,20 +696,19 @@ def main():
     print_settings(len(files))
 
     for index, path in enumerate(files, start=1):
-        run_instance(path, index, len(files))
+
+        try:
+            data = load_instance(path)
+        except (OSError, ValueError) as error:
+            stamp(f"INSTANCE {index}/{len(files)}  {path.name} SKIPPED: {error}")
+            continue
+
+        run_instance(path.stem, data, index, len(files))
 
     print()
     print(RULE)
     stamp("ALL INSTANCES FINISHED")
-
-    try:
-        build_overview(budget_folder(), overview_path())
-    except PermissionError:
-        print(
-            f"Could not write {overview_path()} (is it open in Excel?). "
-            f"Close it, then run: python run_benchmark.py --overview"
-        )
-
+    refresh_overview()
     print(RULE)
 
 

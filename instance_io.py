@@ -14,6 +14,9 @@ from matplotlib.patches import Patch, Polygon
 from scipy.spatial import ConvexHull
 
 
+PLOT_DPI = 150
+
+
 # ============================================================
 # READ VRP FILE
 # ============================================================
@@ -62,6 +65,11 @@ def read_vrp(filepath):
 
     if capacity is None:
         raise ValueError(f"No CAPACITY field found in {filepath}")
+
+    if not coordinates or len(coordinates) != len(demands):
+        raise ValueError(
+            f"{filepath}: {len(coordinates)} coordinates but {len(demands)} demands"
+        )
 
     return np.array(coordinates), np.array(demands), capacity
 
@@ -160,9 +168,28 @@ def write_routes_txt(
             )
 
 
-# ============================================================
-# .SOL OUTPUT (reference format)
-# ============================================================
+def write_trace_txt(output_path, trace, header_lines=()):
+    """
+    Best cost over time, tab-separated, one row per point:
+
+        time_s    time on the run's clock
+        cluster   cluster number (1-based), or "-" for the whole instance
+        distance  best cost of that cluster (or the whole instance) at that time
+
+    Lines starting with # are header and can be skipped when plotting.
+    """
+
+    with open(output_path, "w") as f:
+
+        for line in header_lines:
+            f.write(f"# {line}\n")
+
+        f.write("time_s\tcluster\tdistance\n")
+
+        for time_s, group, cost in trace:
+            cluster = "-" if group is None else group + 1
+            f.write(f"{time_s}\t{cluster}\t{cost}\n")
+
 
 def write_sol(output_path, routes, total_distance):
     """
@@ -212,7 +239,7 @@ def _cluster_hull(points):
 
     try:
         hull = ConvexHull(points)
-    except Exception:
+    except (ValueError, RuntimeError):
         return None
 
     return points[hull.vertices]
@@ -394,14 +421,13 @@ def plot_routes(
         members = _members_by_group(routes, route_groups, n_groups)
 
         _draw_cluster_areas(ax, coordinates, members, colors)
-
-    _draw_routes(ax, coordinates, routes)
-
-    if clustered:
         _draw_customers_by_cluster(ax, coordinates, members, colors)
+
     else:
+
         _draw_customers_plain(ax, coordinates, routes)
 
+    _draw_routes(ax, coordinates, routes)
     _draw_depot(ax, coordinates[0])
 
     _add_legend(ax, clustered)
@@ -413,7 +439,7 @@ def plot_routes(
     ax.grid(alpha=0.2)
 
     fig.tight_layout()
-    fig.savefig(output_file, dpi=200, bbox_inches="tight")
+    fig.savefig(output_file, dpi=PLOT_DPI, bbox_inches="tight")
 
     if show:
         plt.show()

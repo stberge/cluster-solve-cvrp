@@ -3,6 +3,7 @@ Clustering methods and cluster formation for splitting a CVRP into subproblems.
 
     cluster_count(num_customers, min_vehicles, sizing, value)
     make_clusters(coordinates, demands, n_clusters, method, seed=None)
+    clustering_quality(coordinates, demands, clusters, seed=None)
 
 Cluster count
     sizing="routes"     k = ceil(min_vehicles / value)     value = routes per cluster
@@ -25,7 +26,7 @@ belong to the depot.
 import math
 
 import numpy as np
-
+from scipy.spatial.distance import cdist
 from sklearn.cluster import AgglomerativeClustering, KMeans
 from sklearn.metrics import silhouette_score
 
@@ -82,9 +83,7 @@ def sweep_clustering(coordinates, demands, n_clusters, seed=None):
 
         sector_of_position = np.empty(len(order), dtype=int)
 
-        positions = np.array_split(np.arange(len(order)), n_clusters)
-
-        for sector, chunk in enumerate(positions):
+        for sector, chunk in enumerate(np.array_split(np.arange(len(order)), n_clusters)):
             sector_of_position[chunk] = sector
 
     labels = np.empty(len(customers), dtype=int)
@@ -218,15 +217,10 @@ def _silhouette(points, labels, seed):
     except ValueError:
         return None
 
-    return float(score)
+    return round(float(score), 4)
 
 
-def _round(value, digits):
-
-    return None if value is None else round(value, digits)
-
-
-def clustering_quality(coordinates, demands, clusters, seed=0):
+def clustering_quality(coordinates, demands, clusters, seed=None):
     """
     Summary of the clustering before any routes exist. Returns a dict with:
 
@@ -234,7 +228,11 @@ def clustering_quality(coordinates, demands, clusters, seed=0):
         mean_customer_radius     mean distance from a customer to its cluster centroid
         nearest_centroid_share   share of customers whose own centroid is the nearest one
         silhouette               sampled silhouette score, or None
+
+    seed only fixes the silhouette sample; None is treated as 0.
     """
+
+    seed = 0 if seed is None else seed
 
     points = np.asarray(coordinates, dtype=float)[1:]
     customer_demands = np.asarray(demands)[1:]
@@ -256,16 +254,11 @@ def clustering_quality(coordinates, demands, clusters, seed=0):
 
     radii = np.linalg.norm(points - centroids[labels], axis=1)
 
-    distances = np.linalg.norm(
-        points[:, None, :] - centroids[None, :, :],
-        axis=2,
-    )
-
-    nearest_share = float(np.mean(np.argmin(distances, axis=1) == labels))
+    nearest_share = float(np.mean(np.argmin(cdist(points, centroids), axis=1) == labels))
 
     return {
         "demand_cv": round(_coefficient_of_variation(cluster_demands), 3),
         "mean_customer_radius": round(float(radii.mean()), 1),
         "nearest_centroid_share": round(nearest_share, 4),
-        "silhouette": _round(_silhouette(points, labels, seed), 4),
+        "silhouette": _silhouette(points, labels, seed),
     }
