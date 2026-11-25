@@ -79,13 +79,11 @@ from overview import build_overview
 # SETTINGS
 # ============================================================
 
-INSTANCE_DIR = Path(
-    r"C:\Users\20235296\Documents\4de Jaar IE\BEP\data\instances\XL"
-)
+INSTANCE_DIR = Path("XL")
 
-RESULT_ROOT = Path(
-    r"C:\Users\20235296\Documents\4de Jaar IE\BEP\results1"
-)
+# Local disk recommended: OneDrive-synced folders can lock files mid-batch.
+RESULT_ROOT = Path("results")
+
 
 # Search budget per run (s), identical for every method.
 TOTAL_TIME = 600
